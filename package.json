@@ -1,0 +1,14 @@
+{
+  "name": "dns-blocklist-autonomous",
+  "version": "3.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "daemon": "node index.js --daemon"
+  },
+  "dependencies": {
+    "sql.js": "^1.10.0",
+    "node-fetch": "^3.3.0",
+    "croner": "^8.0.0"
+  }
+}

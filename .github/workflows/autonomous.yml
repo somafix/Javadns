@@ -1,0 +1,35 @@
+```yaml
+# .github/workflows/autonomous.yml
+name: DNS Blocklist Autonomous
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install
+        run: npm ci --production --no-audit
+      
+      - name: Run
+        run: node index.js
+      
+      - name: Push
+        run: |
+          git config user.name "DNS Daemon"
+          git add output/ data/
+          git diff --staged --quiet || git commit -m "Auto-update [skip ci]"
+          git push
+```

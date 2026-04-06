@@ -1,33 +1,122 @@
-name: Update Blocklist
+name: DNS Blocklist Builder CI/CD
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */4 * * *'  # Every 4 hours
+  push:
+    branches: [ main, production ]
+    paths:
+      - 'src/**'
+      - 'config/**'
+  workflow_dispatch:  # Manual trigger
 
-permissions:
-  contents: write  # ЭТО РЕШАЕТ ВАШУ ОШИБКУ 403
+env:
+  NODE_VERSION: '20'
+  MAX_DOMAINS: 2000000
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  update:
+  build-and-verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
     steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      
-      - name: Install dependencies (если есть)
-        run: npm ci  # или просто пропустите, если нет package.json
-      
-      - name: Запуск вашего JS скрипта
-        run: node ваш_скрипт.js  # 👈 ЗДЕСЬ ВАШ ФАЙЛ
-      
-      - name: Коммит и пуш изменений
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/
-          git diff --staged --quiet || git commit -m "Auto-update blocklist [skip ci]"
-          git push
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci --production=false
+    
+    - name: Type check
+      run: npx tsc --noEmit
+    
+    - name: Run formal verification
+      run: |
+        npm run test:contracts
+        npm run test:invariants
+    
+    - name: Build blocklist
+      run: |
+        NODE_ENV=production npm run build
+      env:
+        MAX_DOMAINS: ${{ env.MAX_DOMAINS }}
+    
+    - name: Verify output
+      run: |
+        # Check file exists and not empty
+        test -s output/blocklist.txt
+        test -s output/domains.txt
+        test -s output/blocklist.txt.gz
+        
+        # Check minimum domains
+        DOMAIN_COUNT=$(wc -l < output/blocklist.txt)
+        if [ $DOMAIN_COUNT -lt 1000000 ]; then
+          echo "❌ Too few domains: $DOMAIN_COUNT"
+          exit 1
+        fi
+        
+        # Verify checksum
+        sha256sum -c output/integrity.sha256
+        
+        echo "✅ All verification passed"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: blocklist
+        path: output/
+        retention-days: 7
+    
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload security results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
+
+  deploy-production:
+    needs: build-and-verify
+    if: github.ref == 'refs/heads/production'
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: blocklist
+        path: output/
+    
+    - name: Deploy to CDN
+      run: |
+        # Deploy to CloudFlare R2 / AWS S3
+        aws s3 sync output/ s3://your-blocklist-bucket/ \
+          --delete \
+          --cache-control "max-age=3600" \
+          --content-type "text/plain"
+    
+    - name: Invalidate CloudFront cache
+      run: |
+        aws cloudfront create-invalidation \
+          --distribution-id YOUR_DISTRIBUTION_ID \
+          --paths "/*"
+    
+    - name: Notify Slack
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_TITLE: "✅ Blocklist Deployment Successful"
+        SLACK_MESSAGE: "Version: ${{ github.sha }}\nDomains: $(wc -l < output/blocklist.txt)\nSize: $(du -h output/blocklist.txt | cut -f1)"
+        SLACK_COLOR: "good"

@@ -1,14 +1,47 @@
 {
-  "name": "dns-blocklist-autonomous",
-  "version": "3.0.0",
+  "name": "dns-blocklist-builder",
+  "version": "6.0.0",
+  "description": "DNS Blocklist Builder v6.0 - Enterprise Security Hardened Edition",
+  "main": "index.js",
+  "bin": {
+    "dns-blocklist": "./index.js"
+  },
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "daemon": "node index.js --daemon"
+    "build": "node index.js"
   },
+  "keywords": [
+    "dns",
+    "blocklist",
+    "security",
+    "adblock"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "sql.js": "^1.10.0",
-    "node-fetch": "^3.3.0",
-    "croner": "^8.0.0"
+    "axios": "^1.6.0",
+    "limiter": "^2.1.0",
+    "async-mutex": "^0.4.0",
+    "zod": "^3.22.0",
+    "pino": "^8.17.0",
+    "async-sema": "^3.1.1",
+    "lru-cache": "^10.0.0",
+    "memory-cache": "^0.2.0",
+    "class-validator": "^0.14.0",
+    "class-transformer": "^0.5.1",
+    "https-proxy-agent": "^7.0.0",
+    "socks-proxy-agent": "^8.0.0",
+    "bloom-filters": "^3.0.0",
+    "hyperloglog": "^0.1.2",
+    "tdigest": "^0.1.2",
+    "prometheus-api-metrics": "^3.2.0",
+    "dd-trace": "^5.0.0",
+    "v8-profiler-next": "^1.10.0",
+    "heapdump": "^0.3.15",
+    "healthcheck": "^0.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

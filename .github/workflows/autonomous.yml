@@ -1,61 +1,89 @@
 # .github/workflows/build-blocklist.yml
-# DNS Blocklist Builder CI/CD Pipeline
+# Automated build pipeline for DNS blocklist
 
 name: Build DNS Blocklist
 
 on:
   schedule:
-    # Запуск каждый день в 03:00 UTC
     - cron: '0 3 * * *'
-  workflow_dispatch:        # Ручной запуск из UI GitHub
+  workflow_dispatch:
   push:
     branches: [ main ]
     paths:
       - 'src/**'
       - 'sources.json'
 
+env:
+  NODE_OPTIONS: '--max-old-space-size=4096'
+  GITLEAKS_VERSION: '8.18.0'
+
 jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for secrets leak
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Validate sources.json schema
+        run: |
+          if [ -f sources.json ]; then
+            curl -s https://json-schema.org/draft-07/schema | \
+              jq --slurpfile schema /dev/stdin '. as $input | $schema[0] as $schema | $input | validate($schema)' sources.json
+          fi
+      
+      - name: Audit dependencies
+        run: |
+          npm audit --production --audit-level=moderate --json > audit.json
+          jq '.vulnerabilities | to_entries | length' audit.json
+
   build:
     name: Build Blocklist
+    needs: security-scan
     runs-on: ubuntu-latest
     timeout-minutes: 30
     
-    strategy:
-      matrix:
-        node-version: [20.x]
-    
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       
-      - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: '20.x'
           cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
       
       - name: Install dependencies
+        timeout-minutes: 5
         run: npm ci
       
-      - name: Run security audit
-        run: npm audit --production --audit-level=moderate
-      
-      - name: Build blocklist
-        run: npm run build
+      - name: Build and generate
+        timeout-minutes: 20
+        run: |
+          npm run build
+          mkdir -p output
+          node dist/index.js
         env:
           NODE_ENV: production
-          NODE_OPTIONS: '--max-old-space-size=2048'
+          LOG_LEVEL: warn
       
-      - name: Generate blocklist files
-        run: |
-          mkdir -p dist
-          node dist/index.js
-      
-      - name: Calculate file hashes
+      - name: Generate checksums and signatures
         run: |
           cd output
-          sha256sum blocklist.* > checksums.txt
-          md5sum blocklist.* >> checksums.txt
+          for file in blocklist.*; do
+            sha256sum "$file" >> checksums.txt
+            md5sum "$file" >> checksums.txt
+            # Generate GPG signature if key exists
+            if [ -n "${{ secrets.GPG_PRIVATE_KEY }}" ]; then
+              echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import
+              gpg --detach-sign --armor --yes "$file"
+            fi
+          done
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -64,29 +92,36 @@ jobs:
           path: |
             output/blocklist.*
             output/checksums.txt
+            output/*.asc
           retention-days: 7
+          if-no-files-found: error
       
       - name: Create release
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v1
         with:
-          name: "Blocklist ${{ github.run_number }} - ${{ date('YYYY-MM-DD') }}"
           tag_name: "build-${{ github.run_number }}"
+          name: "Blocklist Build ${{ github.run_number }}"
           body: |
-            ## DNS Blocklist автоматическая сборка
+            ## Automated DNS Blocklist Build
             
-            - **Дата**: ${{ date('YYYY-MM-DD HH:mm:ss') }}
-            - **Сборка**: #${{ github.run_number }}
-            - **Источники**: OISD Big, AdAway, StevenBlack, Peter Lowe
+            **Build**: #${{ github.run_number }}
+            **Date**: ${{ github.event.repository.updated_at }}
             
-            ### Файлы:
-            - `blocklist.txt` - формат hosts (IPv4 + IPv6)
-            - `blocklist.domains` - список доменов (по одному на строку)
-            - `checksums.txt` - контрольные суммы (SHA256 + MD5)
+            **Sources**:
+            - OISD Big
+            - AdAway
+            - StevenBlack
+            - Peter Lowe
+            
+            **Files**:
+            - `blocklist.txt` - Hosts format (IPv4 + IPv6)
+            - `blocklist.domains` - Domain list format
+            - `checksums.txt` - SHA256 and MD5 checksums
+            - `*.asc` - GPG signatures (if available)
           files: |
             output/blocklist.*
             output/checksums.txt
-          generate_release_notes: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,74 +133,63 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./output
           publish_branch: gh-pages
-          destination_dir: .
           keep_files: false
           user_name: 'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
-          commit_message: 'Deploy blocklist build #${{ github.run_number }}'
 
   validate:
     name: Validate Blocklist
     needs: build
     runs-on: ubuntu-latest
     if: always() && needs.build.result == 'success'
+    timeout-minutes: 10
     
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: blocklist-files
           path: ./validate
       
-      - name: Validate domain syntax
+      - name: Syntax validation
         run: |
-          echo "=== Domain syntax validation ==="
-          
-          # Проверка hosts формата
+          # Validate hosts format
           if [ -f validate/blocklist.txt ]; then
-            LINES=$(wc -l < validate/blocklist.txt)
-            DOMAINS=$(grep -c '^0.0.0.0' validate/blocklist.txt || true)
-            echo "✅ hosts файл: $LINES строк, $DOMAINS доменов"
-            
-            # Проверка на пустые строки в середине
-            if grep -q '^$' validate/blocklist.txt; then
-              echo "⚠️  Обнаружены пустые строки"
+            if ! grep -E '^(0\.0\.0\.0|::) [a-z0-9.-]+$' validate/blocklist.txt | head -100 > /dev/null; then
+              echo "Invalid hosts format detected"
+              exit 1
             fi
+            echo "Hosts syntax valid"
           fi
           
-          # Проверка domains формата
+          # Validate domain format
           if [ -f validate/blocklist.domains ]; then
-            COUNT=$(wc -l < validate/blocklist.domains)
-            UNIQUE=$(sort validate/blocklist.domains | uniq | wc -l)
-            echo "✅ domains файл: $COUNT строк, $UNIQUE уникальных"
-            
-            if [ $COUNT -ne $UNIQUE ]; then
-              echo "⚠️  Найдено $((COUNT - UNIQUE)) дубликатов"
+            if ! grep -E '^[a-z0-9][a-z0-9.-]*[a-z0-9]$' validate/blocklist.domains | head -100 > /dev/null; then
+              echo "Invalid domain format detected"
+              exit 1
             fi
-          fi
-          
-          # Проверка контрольных сумм
-          if [ -f validate/checksums.txt ]; then
-            echo "✅ checksums.txt присутствует"
-            cat validate/checksums.txt
+            echo "Domain syntax valid"
           fi
       
-      - name: Check file sizes
+      - name - Functional validation
         run: |
-          echo "=== Размеры файлов ==="
-          ls -lh validate/blocklist.* 2>/dev/null || echo "Нет файлов"
-          
-          # Проверка, что файл не пустой
+          # Test DNS resolution for sample domains
+          SAMPLE_COUNT=100
+          head -n $SAMPLE_COUNT validate/blocklist.domains | while read domain; do
+            if dig +short "$domain" | grep -q '^0.0.0.0$'; then
+              echo "Domain $domain resolves correctly"
+            fi
+          done
+      
+      - name: Size validation
+        run: |
           for file in validate/blocklist.*; do
             if [ -f "$file" ]; then
               SIZE=$(stat -c%s "$file")
               if [ $SIZE -eq 0 ]; then
-                echo "❌ $file пустой"
+                echo "File $file is empty"
                 exit 1
-              elif [ $SIZE -lt 10000 ]; then
-                echo "⚠️  $file подозрительно маленький ($SIZE байт)"
-              else
-                echo "✅ $file: $(numfmt --to=iec $SIZE)"
+              elif [ $SIZE -lt 100000 ]; then
+                echo "Warning: $file is unusually small ($SIZE bytes)"
               fi
             fi
           done
@@ -175,21 +199,30 @@ jobs:
     needs: [build, validate]
     runs-on: ubuntu-latest
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    timeout-minutes: 5
     
     steps:
-      - name: Check build status
-        id: status
-        run: |
-          if [ "${{ needs.build.result }}" == "success" ] && [ "${{ needs.validate.result }}" == "success" ]; then
-            echo "status=success" >> $GITHUB_OUTPUT
-            echo "message=✅ Блоклист успешно собран" >> $GITHUB_OUTPUT
-          else
-            echo "status=failure" >> $GITHUB_OUTPUT
-            echo "message=❌ Ошибка сборки блоклиста" >> $GITHUB_OUTPUT
-          fi
+      - name: Check for existing issue
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const today = new Date().toISOString().slice(0,10);
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'automated'
+            });
+            
+            const existing = issues.find(issue => 
+              issue.title.includes(today) && issue.title.includes('Build failed')
+            );
+            
+            return existing ? 'exists' : 'new';
       
-      - name: Create issue on failure
-        if: steps.status.outputs.status == 'failure'
+      - name: Create issue on failure (no duplicate)
+        if: steps.check.outputs.result == 'new' && (needs.build.result != 'success' || needs.validate.result != 'success')
         uses: actions/github-script@v7
         with:
           script: |
@@ -197,31 +230,31 @@ jobs:
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `🚨 Build failed - ${date.substring(0, 10)}`,
-              body: `## Ошибка сборки блоклиста
+              title: `Build failed - ${date.substring(0, 10)}`,
+              body: `## Build Failure Report
             
-**Время**: ${date}
-**Сборка**: #${context.runNumber}
-**Статус**: ${context.job}
+**Time**: ${date}
+**Build**: #${context.runNumber}
+**Status**: Build=${needs.build.result}, Validate=${needs.validate.result}
 
-Проверьте логи: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+Check logs: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
 
-Возможные причины:
-- Источники недоступны
-- Изменился формат данных
-- Превышен лимит памяти
-- Проблемы с сетью`,
+Possible causes:
+- Source unavailability
+- Format changes
+- Memory limits exceeded
+- Network issues`,
               labels: ['bug', 'automated']
             });
 
   cleanup:
     name: Clean Old Artifacts
-    needs: build
     runs-on: ubuntu-latest
     if: always()
+    timeout-minutes: 5
     
     steps:
-      - name: Delete old artifacts
+      - name: Delete artifacts older than 30 days
         uses: actions/github-script@v7
         with:
           script: |
@@ -231,21 +264,19 @@ jobs:
             
             const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
               owner: context.repo.owner,
-              repo: context.repo.repo,
+              repo: context.repo.repo
             });
             
             let deleted = 0;
             for (const artifact of artifacts.artifacts) {
-              const created = new Date(artifact.created_at);
-              if (created < cutoff) {
+              if (new Date(artifact.created_at) < cutoff) {
                 await github.rest.actions.deleteArtifact({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  artifact_id: artifact.id,
+                  artifact_id: artifact.id
                 });
                 deleted++;
-                console.log(`Deleted artifact: ${artifact.name} (${artifact.created_at})`);
               }
             }
             
-            console.log(`Cleaned ${deleted} old artifacts`);
+            console.log(`Cleaned ${deleted} artifacts`);

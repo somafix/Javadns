@@ -24,18 +24,6 @@ A production-ready, high-performance DNS blocklist builder with advanced feature
 - **Comprehensive Logging** - Structured logging with Pino
 - **Metrics Collection** - Built-in performance metrics
 
-## 📋 Table of Contents
-
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [API Reference](#api-reference)
-- [Output Formats](#output-formats)
-- [Performance](#performance)
-- [Security](#security)
-- [Error Handling](#error-handling)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## 📦 Installation
 

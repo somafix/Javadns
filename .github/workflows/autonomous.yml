@@ -1,282 +1,109 @@
-# .github/workflows/build-blocklist.yml
-# Automated build pipeline for DNS blocklist
+# ============================================================================
+# DNS BLOCKLIST BUILDER CONFIGURATION
+# ============================================================================
 
-name: Build DNS Blocklist
+app:
+  name: "dns-blocklist-builder"
+  version: "6.0.0"
+  environment: "production"
+  log_level: "info"
+  graceful_shutdown_timeout_seconds: 30
 
-on:
-  schedule:
-    - cron: '0 3 * * *'
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'src/**'
-      - 'sources.json'
+output:
+  directory: "./output"
+  formats:
+    - "domains"
+    - "hosts"
+  compression_enabled: true
+  compression_level: 9
+  max_domains_for_hosts_format: 500000
 
-env:
-  NODE_OPTIONS: '--max-old-space-size=4096'
-  GITLEAKS_VERSION: '8.18.0'
+sources:
+  - name: "OISD Big"
+    url: "https://big.oisd.nl/domains"
+    enabled: true
+    timeout_seconds: 30
+    retries: 3
+  
+  - name: "AdAway"
+    url: "https://adaway.org/hosts.txt"
+    enabled: true
+    timeout_seconds: 30
+    retries: 3
+  
+  - name: "StevenBlack"
+    url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+    enabled: true
+    timeout_seconds: 30
+    retries: 3
+  
+  - name: "Peter Lowe"
+    url: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0"
+    enabled: true
+    timeout_seconds: 30
+    retries: 3
 
-jobs:
-  security-scan:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Check for secrets leak
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Validate sources.json schema
-        run: |
-          if [ -f sources.json ]; then
-            curl -s https://json-schema.org/draft-07/schema | \
-              jq --slurpfile schema /dev/stdin '. as $input | $schema[0] as $schema | $input | validate($schema)' sources.json
-          fi
-      
-      - name: Audit dependencies
-        run: |
-          npm audit --production --audit-level=moderate --json > audit.json
-          jq '.vulnerabilities | to_entries | length' audit.json
+fetch:
+  default_timeout_seconds: 30
+  max_retries: 3
+  retry_base_delay_milliseconds: 1000
+  retry_max_delay_milliseconds: 30000
+  max_response_size_megabytes: 100
+  decompression_ratio_limit: 10
+  cache:
+    enabled: true
+    directory: "./cache"
+    ttl_milliseconds: 86400000
 
-  build:
-    name: Build Blocklist
-    needs: security-scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          cache: 'npm'
-          cache-dependency-path: 'package-lock.json'
-      
-      - name: Install dependencies
-        timeout-minutes: 5
-        run: npm ci
-      
-      - name: Build and generate
-        timeout-minutes: 20
-        run: |
-          npm run build
-          mkdir -p output
-          node dist/index.js
-        env:
-          NODE_ENV: production
-          LOG_LEVEL: warn
-      
-      - name: Generate checksums and signatures
-        run: |
-          cd output
-          for file in blocklist.*; do
-            sha256sum "$file" >> checksums.txt
-            md5sum "$file" >> checksums.txt
-            # Generate GPG signature if key exists
-            if [ -n "${{ secrets.GPG_PRIVATE_KEY }}" ]; then
-              echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import
-              gpg --detach-sign --armor --yes "$file"
-            fi
-          done
-      
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: blocklist-files
-          path: |
-            output/blocklist.*
-            output/checksums.txt
-            output/*.asc
-          retention-days: 7
-          if-no-files-found: error
-      
-      - name: Create release
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: "build-${{ github.run_number }}"
-          name: "Blocklist Build ${{ github.run_number }}"
-          body: |
-            ## Automated DNS Blocklist Build
-            
-            **Build**: #${{ github.run_number }}
-            **Date**: ${{ github.event.repository.updated_at }}
-            
-            **Sources**:
-            - OISD Big
-            - AdAway
-            - StevenBlack
-            - Peter Lowe
-            
-            **Files**:
-            - `blocklist.txt` - Hosts format (IPv4 + IPv6)
-            - `blocklist.domains` - Domain list format
-            - `checksums.txt` - SHA256 and MD5 checksums
-            - `*.asc` - GPG signatures (if available)
-          files: |
-            output/blocklist.*
-            output/checksums.txt
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Deploy to GitHub Pages
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        uses: peaceiris/actions-gh-pages@v3
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./output
-          publish_branch: gh-pages
-          keep_files: false
-          user_name: 'github-actions[bot]'
-          user_email: 'github-actions[bot]@users.noreply.github.com'
+circuit_breaker:
+  failure_threshold: 5
+  timeout_milliseconds: 60000
 
-  validate:
-    name: Validate Blocklist
-    needs: build
-    runs-on: ubuntu-latest
-    if: always() && needs.build.result == 'success'
-    timeout-minutes: 10
-    
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: blocklist-files
-          path: ./validate
-      
-      - name: Syntax validation
-        run: |
-          # Validate hosts format
-          if [ -f validate/blocklist.txt ]; then
-            if ! grep -E '^(0\.0\.0\.0|::) [a-z0-9.-]+$' validate/blocklist.txt | head -100 > /dev/null; then
-              echo "Invalid hosts format detected"
-              exit 1
-            fi
-            echo "Hosts syntax valid"
-          fi
-          
-          # Validate domain format
-          if [ -f validate/blocklist.domains ]; then
-            if ! grep -E '^[a-z0-9][a-z0-9.-]*[a-z0-9]$' validate/blocklist.domains | head -100 > /dev/null; then
-              echo "Invalid domain format detected"
-              exit 1
-            fi
-            echo "Domain syntax valid"
-          fi
-      
-      - name - Functional validation
-        run: |
-          # Test DNS resolution for sample domains
-          SAMPLE_COUNT=100
-          head -n $SAMPLE_COUNT validate/blocklist.domains | while read domain; do
-            if dig +short "$domain" | grep -q '^0.0.0.0$'; then
-              echo "Domain $domain resolves correctly"
-            fi
-          done
-      
-      - name: Size validation
-        run: |
-          for file in validate/blocklist.*; do
-            if [ -f "$file" ]; then
-              SIZE=$(stat -c%s "$file")
-              if [ $SIZE -eq 0 ]; then
-                echo "File $file is empty"
-                exit 1
-              elif [ $SIZE -lt 100000 ]; then
-                echo "Warning: $file is unusually small ($SIZE bytes)"
-              fi
-            fi
-          done
+validation:
+  min_domain_length: 3
+  max_domain_length: 253
+  max_label_length: 63
+  max_labels: 127
+  block_punycode: true
+  max_risk_score: 50
+  confusable_characters:
+    cyrillic_a: "a"
+    cyrillic_e: "e"
+    cyrillic_o: "o"
+    cyrillic_p: "p"
+    cyrillic_c: "c"
+    cyrillic_x: "x"
+    cyrillic_y: "y"
+    cyrillic_k: "k"
+    cyrillic_b: "b"
+    cyrillic_h: "h"
 
-  notify:
-    name: Send Notifications
-    needs: [build, validate]
-    runs-on: ubuntu-latest
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    timeout-minutes: 5
-    
-    steps:
-      - name: Check for existing issue
-        id: check
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const today = new Date().toISOString().slice(0,10);
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open',
-              labels: 'automated'
-            });
-            
-            const existing = issues.find(issue => 
-              issue.title.includes(today) && issue.title.includes('Build failed')
-            );
-            
-            return existing ? 'exists' : 'new';
-      
-      - name: Create issue on failure (no duplicate)
-        if: steps.check.outputs.result == 'new' && (needs.build.result != 'success' || needs.validate.result != 'success')
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const date = new Date().toISOString();
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Build failed - ${date.substring(0, 10)}`,
-              body: `## Build Failure Report
-            
-**Time**: ${date}
-**Build**: #${context.runNumber}
-**Status**: Build=${needs.build.result}, Validate=${needs.validate.result}
+deduplication:
+  expected_domains_count: 5000000
+  max_domains_count: 10000000
+  bloom_filter_error_rate: 0.01
 
-Check logs: ${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+performance:
+  worker_count: 4
+  batch_size: 10000
+  buffer_size_bytes: 262144
 
-Possible causes:
-- Source unavailability
-- Format changes
-- Memory limits exceeded
-- Network issues`,
-              labels: ['bug', 'automated']
-            });
+security:
+  allowed_protocols:
+    - "http"
+    - "https"
+  block_private_ip_addresses: true
+  max_redirects: 5
+  user_agent: "DNS-Blocklist-Builder/6.0"
 
-  cleanup:
-    name: Clean Old Artifacts
-    runs-on: ubuntu-latest
-    if: always()
-    timeout-minutes: 5
-    
-    steps:
-      - name: Delete artifacts older than 30 days
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const days = 30;
-            const cutoff = new Date();
-            cutoff.setDate(cutoff.getDate() - days);
-            
-            const { data: artifacts } = await github.rest.actions.listArtifactsForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo
-            });
-            
-            let deleted = 0;
-            for (const artifact of artifacts.artifacts) {
-              if (new Date(artifact.created_at) < cutoff) {
-                await github.rest.actions.deleteArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: artifact.id
-                });
-                deleted++;
-              }
-            }
-            
-            console.log(`Cleaned ${deleted} artifacts`);
+monitoring:
+  metrics_enabled: true
+  metrics_prefix: "blocklist_builder"
+  health_check_enabled: true
+  health_check_port: 8080
+
+docker:
+  memory_limit_megabytes: 2048
+  cpu_limit_cores: 2
+  read_only_root_filesystem: true
+  temporary_directory: "/tmp"

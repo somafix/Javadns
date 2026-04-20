@@ -1,109 +1,27 @@
-# ============================================================================
-# DNS BLOCKLIST BUILDER CONFIGURATION
-# ============================================================================
-
 app:
-  name: "dns-blocklist-builder"
-  version: "6.0.0"
-  environment: "production"
-  log_level: "info"
-  graceful_shutdown_timeout_seconds: 30
+  name: dns-blocklist-builder
+  version: 6.0.0
+  environment: production
+  log_level: info
+  shutdown_timeout_sec: 30
 
 output:
-  directory: "./output"
+  directory: ./output
   formats:
-    - "domains"
-    - "hosts"
-  compression_enabled: true
-  compression_level: 9
-  max_domains_for_hosts_format: 500000
+    - domains
+    - hosts
+  compress: true
+  compress_level: 9
+  hosts_threshold: 500000
 
 sources:
-  - name: "OISD Big"
-    url: "https://big.oisd.nl/domains"
+  - name: OISD Big
+    url: https://big.oisd.nl/domains
     enabled: true
-    timeout_seconds: 30
+    timeout_sec: 30
     retries: 3
-  
-  - name: "AdAway"
-    url: "https://adaway.org/hosts.txt"
+  - name: AdAway
+    url: https://adaway.org/hosts.txt
     enabled: true
-    timeout_seconds: 30
+    timeout_sec: 30
     retries: 3
-  
-  - name: "StevenBlack"
-    url: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
-    enabled: true
-    timeout_seconds: 30
-    retries: 3
-  
-  - name: "Peter Lowe"
-    url: "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0"
-    enabled: true
-    timeout_seconds: 30
-    retries: 3
-
-fetch:
-  default_timeout_seconds: 30
-  max_retries: 3
-  retry_base_delay_milliseconds: 1000
-  retry_max_delay_milliseconds: 30000
-  max_response_size_megabytes: 100
-  decompression_ratio_limit: 10
-  cache:
-    enabled: true
-    directory: "./cache"
-    ttl_milliseconds: 86400000
-
-circuit_breaker:
-  failure_threshold: 5
-  timeout_milliseconds: 60000
-
-validation:
-  min_domain_length: 3
-  max_domain_length: 253
-  max_label_length: 63
-  max_labels: 127
-  block_punycode: true
-  max_risk_score: 50
-  confusable_characters:
-    cyrillic_a: "a"
-    cyrillic_e: "e"
-    cyrillic_o: "o"
-    cyrillic_p: "p"
-    cyrillic_c: "c"
-    cyrillic_x: "x"
-    cyrillic_y: "y"
-    cyrillic_k: "k"
-    cyrillic_b: "b"
-    cyrillic_h: "h"
-
-deduplication:
-  expected_domains_count: 5000000
-  max_domains_count: 10000000
-  bloom_filter_error_rate: 0.01
-
-performance:
-  worker_count: 4
-  batch_size: 10000
-  buffer_size_bytes: 262144
-
-security:
-  allowed_protocols:
-    - "http"
-    - "https"
-  block_private_ip_addresses: true
-  max_redirects: 5
-  user_agent: "DNS-Blocklist-Builder/6.0"
-
-monitoring:
-  metrics_enabled: true
-  metrics_prefix: "blocklist_builder"
-  health_check_enabled: true
-  health_check_port: 8080
-
-docker:
-  memory_limit_megabytes: 2048
-  cpu_limit_cores: 2
-  read_only_root_filesystem: true
-  temporary_directory: "/tmp"

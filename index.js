@@ -8,10 +8,8 @@ import { Mutex } from 'async-mutex';
 import pino from 'pino';
 import axios, { AxiosInstance, AxiosError } from 'axios';
 import { BloomFilter } from 'bloom-filters';
-import { HyperLogLog } from 'hyperloglog';
 import dns from 'dns';
 import { promisify } from 'util';
-import { Worker } from 'worker_threads';
 import os from 'os';
 
 // ============================================================================
@@ -32,7 +30,7 @@ const RETRY_MAX_DELAY_MS = 30000;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 60000;
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 30000;
-const WORKER_COUNT = os.cpus().length;
+const WORKER_COUNT = Math.max(1, Math.min(os.cpus().length, 8));
 
 // ============================================================================
 // INTERFACES
@@ -104,16 +102,16 @@ interface FetchResult {
 // ============================================================================
 
 class NoopLogger implements Logger {
-    debug(msg: string, args?: Record<string, unknown>): void {}
-    info(msg: string, args?: Record<string, unknown>): void {}
-    warn(msg: string, args?: Record<string, unknown>): void {}
-    error(msg: string, err?: Error, args?: Record<string, unknown>): void {}
+    debug(_msg: string, _args?: Record<string, unknown>): void {}
+    info(_msg: string, _args?: Record<string, unknown>): void {}
+    warn(_msg: string, _args?: Record<string, unknown>): void {}
+    error(_msg: string, _err?: Error, _args?: Record<string, unknown>): void {}
 }
 
 class NoopMetrics implements Metrics {
-    recordDuration(name: string, durationMs: number, labels?: Record<string, string>): void {}
-    recordCounter(name: string, value: number, labels?: Record<string, string>): void {}
-    recordGauge(name: string, value: number, labels?: Record<string, string>): void {}
+    recordDuration(_name: string, _durationMs: number, _labels?: Record<string, string>): void {}
+    recordCounter(_name: string, _value: number, _labels?: Record<string, string>): void {}
+    recordGauge(_name: string, _value: number, _labels?: Record<string, string>): void {}
 }
 
 // ============================================================================
@@ -187,7 +185,7 @@ class SSRFProtector {
         /^fe80:/
     ];
 
-    static async validate(url: URL): Promise<boolean> {
+    static async validate(url: URL): Promise<void> {
         if (url.protocol !== 'http:' && url.protocol !== 'https:') {
             throw new Error(`Unsupported protocol: ${url.protocol}`);
         }
@@ -200,8 +198,6 @@ class SSRFProtector {
                 throw new Error(`Blocked private IP: ${address} for hostname ${url.hostname}`);
             }
         }
-        
-        return true;
     }
 }
 
@@ -216,7 +212,7 @@ class RetryHandler {
         baseDelayMs: number = RETRY_BASE_DELAY_MS,
         logger?: Logger
     ): Promise<T> {
-        let lastError: Error;
+        let lastError: Error = new Error('Unknown error');
         
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -241,7 +237,7 @@ class RetryHandler {
             }
         }
         
-        throw lastError!;
+        throw lastError;
     }
 }
 
@@ -378,7 +374,7 @@ class FetchManager {
 
 class DomainValidator {
     private static readonly DOMAIN_REGEX = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i;
-    private static readonly CONFUSABLE_MAP = new Map([
+    private static readonly CONFUSABLE_MAP = new Map<string, string>([
         ['а', 'a'], ['е', 'e'], ['о', 'o'], ['р', 'p'], ['с', 'c'],
         ['х', 'x'], ['у', 'y'], ['к', 'k'], ['в', 'b'], ['н', 'h']
     ]);
@@ -448,6 +444,7 @@ class DeduplicationEngine {
     private bloomFilter: BloomFilter;
     private mutex = new Mutex();
     private readonly maxSize: number;
+    private totalProcessed = 0;
 
     constructor(expectedSize: number = 5000000, maxSize: number = 10000000) {
         this.bloomFilter = new BloomFilter(expectedSize, 0.01);
@@ -470,6 +467,7 @@ class DeduplicationEngine {
         const release = await this.mutex.acquire();
         
         try {
+            this.totalProcessed++;
             this.evictOldest();
             
             if (this.bloomFilter.has(domain)) {
@@ -498,19 +496,14 @@ class DeduplicationEngine {
     }
 
     getAll(): string[] {
-        const release = this.mutex.acquire();
-        try {
-            return Array.from(this.domains.keys()).sort();
-        } finally {
-            release.then(r => r());
-        }
+        return Array.from(this.domains.keys()).sort();
     }
 
-    getStats(totalProcessed: number): DedupStats {
+    getStats(): DedupStats {
         return {
             uniqueDomains: this.domains.size,
-            totalProcessed,
-            duplicateRate: totalProcessed > 0 ? (1 - this.domains.size / totalProcessed) * 100 : 0,
+            totalProcessed: this.totalProcessed,
+            duplicateRate: this.totalProcessed > 0 ? (1 - this.domains.size / this.totalProcessed) * 100 : 0,
         };
     }
 }
@@ -724,35 +717,24 @@ class BlocklistBuilder {
         fetchResults: FetchResult[],
         validationContext: ValidationContext
     ): Promise<ProcessResult> {
-        let totalProcessed = 0;
-        const workerPromises: Promise<void>[] = [];
+        const allDomains: string[] = [];
         
         for (const result of fetchResults) {
             const domains = DomainParser.parse(result.data);
+            allDomains.push(...domains);
             
-            const chunkSize = Math.ceil(domains.length / WORKER_COUNT);
-            for (let i = 0; i < domains.length; i += chunkSize) {
-                const chunk = domains.slice(i, i + chunkSize);
-                workerPromises.push(this.processChunk(chunk, result.sourceName, validationContext));
+            for (const domain of domains) {
+                const validation = this.validator.validate(domain, validationContext);
+                if (validation.isValid && validation.normalized) {
+                    await this.dedupEngine.add(validation.normalized, result.sourceName);
+                }
             }
         }
-        
-        await Promise.all(workerPromises);
         
         const domains = this.dedupEngine.getAll();
-        const stats = this.dedupEngine.getStats(totalProcessed);
+        const stats = this.dedupEngine.getStats();
         
         return { domains, stats };
-    }
-    
-    private async processChunk(domains: string[], sourceName: string, validationContext: ValidationContext): Promise<void> {
-        for (const domain of domains) {
-            const validation = this.validator.validate(domain, validationContext);
-            
-            if (validation.isValid && validation.normalized) {
-                await this.dedupEngine.add(validation.normalized, sourceName);
-            }
-        }
     }
 
     private async generateOutput(domains: string[], outputDir: string): Promise<string> {
@@ -788,7 +770,11 @@ async function main(): Promise<void> {
     
     const builder = new BlocklistBuilder(logger, metrics);
     
+    let shuttingDown = false;
     const shutdownHandler = async (signal: string) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        
         logger.warn(`Received ${signal}, shutting down gracefully...`);
         
         const timeout = setTimeout(() => {

@@ -9,295 +9,51 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Run blocklist builder
+      - name: Create and run builder
         run: |
-          cat > builder.js << 'EOF'
-          import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
-          import { join, resolve } from 'path';
+          cat > index.mjs << 'EOF'
+          import { writeFileSync, mkdirSync } from 'fs';
           import { gzipSync } from 'zlib';
-          import crypto from 'crypto';
-
-          const MIN_DOMAIN_LENGTH = 3;
-          const MAX_DOMAIN_LENGTH = 253;
-          const MAX_LABEL_LENGTH = 63;
-          const MAX_RESPONSE_SIZE_BYTES = 100 * 1024 * 1024;
-          const CACHE_TTL_MS = 86400000;
-
-          class CacheManager {
-              constructor(cacheDir = './cache') {
-                  this.cacheDir = cacheDir;
-                  mkdirSync(cacheDir, { recursive: true });
-              }
-              
-              getCachePath(url) {
-                  const hash = crypto.createHash('sha256').update(url).digest('hex');
-                  return join(this.cacheDir, `${hash}.cache`);
-              }
-              
-              get(url) {
-                  try {
-                      const cachePath = this.getCachePath(url);
-                      if (!existsSync(cachePath)) return null;
-                      const stats = require('fs').statSync(cachePath);
-                      if (Date.now() - stats.mtimeMs > CACHE_TTL_MS) return null;
-                      return readFileSync(cachePath, 'utf8');
-                  } catch {
-                      return null;
-                  }
-              }
-              
-              set(url, data) {
-                  try {
-                      const cachePath = this.getCachePath(url);
-                      writeFileSync(cachePath, data, 'utf8');
-                  } catch (error) {
-                      console.warn(`Failed to write cache: ${error.message}`);
-                  }
-              }
-          }
-
-          class FetchManager {
-              constructor() {
-                  this.cache = new CacheManager();
-              }
-              
-              async fetch(url, sourceName) {
-                  const cached = this.cache.get(url);
-                  if (cached) {
-                      console.log(`✓ Using cached ${sourceName}`);
-                      return cached;
-                  }
-                  
-                  const controller = new AbortController();
-                  const timeoutId = setTimeout(() => controller.abort(), 30000);
-                  
-                  try {
-                      const response = await fetch(url, {
-                          signal: controller.signal,
-                          headers: { 'User-Agent': 'DNS-Blocklist-Builder/6.0' }
-                      });
-                      
-                      clearTimeout(timeoutId);
-                      
-                      if (!response.ok) {
-                          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                      }
-                      
-                      const data = await response.text();
-                      
-                      if (data.length > MAX_RESPONSE_SIZE_BYTES) {
-                          throw new Error(`Response too large: ${data.length} bytes`);
-                      }
-                      
-                      this.cache.set(url, data);
-                      console.log(`✓ Downloaded ${sourceName} (${(data.length / 1024 / 1024).toFixed(2)} MB)`);
-                      
-                      return data;
-                  } catch (error) {
-                      clearTimeout(timeoutId);
-                      throw new Error(`Failed to fetch ${sourceName}: ${error.message}`);
-                  }
-              }
-          }
-
-          class DomainValidator {
-              validate(domain) {
-                  if (!domain || typeof domain !== 'string') {
-                      return { isValid: false, normalized: null };
-                  }
-                  
-                  let normalized = domain.normalize('NFKC').toLowerCase().trim();
-                  
-                  if (normalized.endsWith('.')) {
-                      normalized = normalized.slice(0, -1);
-                  }
-                  
-                  if (normalized.length < MIN_DOMAIN_LENGTH || normalized.length > MAX_DOMAIN_LENGTH) {
-                      return { isValid: false, normalized: null };
-                  }
-                  
-                  if (normalized.startsWith('xn--')) {
-                      return { isValid: false, normalized: null };
-                  }
-                  
-                  const labels = normalized.split('.');
-                  if (labels.length > 127) {
-                      return { isValid: false, normalized: null };
-                  }
-                  
-                  const domainRegex = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i;
-                  for (const label of labels) {
-                      if (label.length === 0 || label.length > MAX_LABEL_LENGTH) {
-                          return { isValid: false, normalized: null };
-                      }
-                      
-                      if (label.startsWith('-') || label.endsWith('-')) {
-                          return { isValid: false, normalized: null };
-                      }
-                      
-                      if (!domainRegex.test(label)) {
-                          return { isValid: false, normalized: null };
-                      }
-                  }
-                  
-                  return { isValid: true, normalized };
-              }
-          }
-
-          class DeduplicationEngine {
-              constructor() {
-                  this.domains = new Map();
-                  this.totalProcessed = 0;
-              }
-              
-              add(domain) {
-                  this.totalProcessed++;
-                  
-                  if (this.domains.has(domain)) {
-                      this.domains.set(domain, (this.domains.get(domain) || 0) + 1);
-                      return false;
-                  }
-                  
-                  this.domains.set(domain, 1);
-                  return true;
-              }
-              
-              getAll() {
-                  return Array.from(this.domains.keys()).sort();
-              }
-              
-              getStats() {
-                  return {
-                      unique: this.domains.size,
-                      total: this.totalProcessed,
-                      duplicateRate: this.totalProcessed > 0 
-                          ? ((this.totalProcessed - this.domains.size) / this.totalProcessed) * 100 
-                          : 0,
-                  };
-              }
-          }
-
-          class DomainParser {
-              static parse(content) {
-                  const domains = [];
-                  const lines = content.split(/\r?\n/);
-                  const hostsIps = new Set(['0.0.0.0', '127.0.0.1', '::1', '0']);
-                  const domainRegex = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i;
-                  
-                  for (const line of lines) {
-                      const trimmed = line.trim();
-                      
-                      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) {
-                          continue;
-                      }
-                      
-                      const parts = trimmed.split(/\s+/);
-                      if (parts.length >= 2 && hostsIps.has(parts[0])) {
-                          const domain = parts[1].toLowerCase();
-                          if (domainRegex.test(domain) && domain.length <= MAX_DOMAIN_LENGTH) {
-                              domains.push(domain);
-                          }
-                      } else if (domainRegex.test(trimmed) && trimmed.length <= MAX_DOMAIN_LENGTH) {
-                          domains.push(trimmed.toLowerCase());
-                      }
-                  }
-                  
-                  return domains;
-              }
-          }
-
-          class OutputGenerator {
-              static generate(domains, format) {
-                  const now = new Date().toISOString();
-                  let content = `# DNS Blocklist v6.0
-          # Generated: ${now}
-          # Total Domains: ${domains.length.toLocaleString()}
-          # ============================================================================
-
-          `;
-                  
-                  if (format === 'hosts') {
-                      for (const domain of domains) {
-                          content += `0.0.0.0 ${domain}\n:: ${domain}\n`;
-                      }
-                  } else {
-                      content += domains.join('\n');
-                  }
-                  
-                  return content;
-              }
-              
-              static write(content, outputDir, format) {
-                  const outputPath = resolve(outputDir, `blocklist.${format === 'hosts' ? 'txt' : 'domains'}`);
-                  mkdirSync(outputDir, { recursive: true });
-                  
-                  writeFileSync(outputPath, content, 'utf8');
-                  console.log(`✓ Written to ${outputPath}`);
-                  
-                  const gzipPath = `${outputPath}.gz`;
-                  writeFileSync(gzipPath, gzipSync(content, { level: 9 }));
-                  console.log(`✓ Written compressed to ${gzipPath}`);
-                  
-                  return outputPath;
-              }
-          }
 
           const SOURCES = [
-              { name: 'OISD Big', url: 'https://big.oisd.nl/domains' },
-              { name: 'AdAway', url: 'https://adaway.org/hosts.txt' },
-              { name: 'StevenBlack', url: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts' },
-              { name: 'Peter Lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0' },
+            'https://big.oisd.nl/domains',
+            'https://adaway.org/hosts.txt',
+            'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts'
           ];
 
-          async function main() {
-              console.log('🚀 DNS Blocklist Builder v6.0\n');
-              
-              const validator = new DomainValidator();
-              const fetcher = new FetchManager();
-              const dedupEngine = new DeduplicationEngine();
-              
-              console.log(`📡 Fetching ${SOURCES.length} sources...\n`);
-              
-              const allDomains = [];
-              for (const source of SOURCES) {
-                  try {
-                      const content = await fetcher.fetch(source.url, source.name);
-                      const domains = DomainParser.parse(content);
-                      allDomains.push(...domains);
-                      console.log(`  → ${source.name}: ${domains.length.toLocaleString()} domains`);
-                  } catch (error) {
-                      console.error(`  ✗ ${source.name}: ${error.message}`);
-                  }
+          const uniqueDomains = new Set();
+
+          for (const url of SOURCES) {
+            console.log(`Fetching ${url}...`);
+            const res = await fetch(url);
+            const text = await res.text();
+            const lines = text.split('\n');
+            
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (trimmed && !trimmed.startsWith('#')) {
+                const parts = trimmed.split(/\s+/);
+                let domain = parts.length >= 2 ? parts[1] : parts[0];
+                domain = domain.toLowerCase().replace(/\.$/, '');
+                if (domain.match(/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/) && domain.length <= 253) {
+                  uniqueDomains.add(domain);
+                }
               }
-              
-              console.log(`\n🔍 Processing ${allDomains.length.toLocaleString()} total domains...`);
-              
-              for (const domain of allDomains) {
-                  const { isValid, normalized } = validator.validate(domain);
-                  if (isValid && normalized) {
-                      dedupEngine.add(normalized);
-                  }
-              }
-              
-              const stats = dedupEngine.getStats();
-              console.log(`\n📊 Deduplication stats:`);
-              console.log(`  → Unique domains: ${stats.unique.toLocaleString()}`);
-              console.log(`  → Duplicate rate: ${stats.duplicateRate.toFixed(2)}%`);
-              
-              const domains = dedupEngine.getAll();
-              const format = domains.length > 500000 ? 'domains' : 'hosts';
-              const content = OutputGenerator.generate(domains, format);
-              const outputPath = OutputGenerator.write(content, './output', format);
-              
-              console.log(`\n✅ Build completed!`);
-              console.log(`📁 Output: ${outputPath}`);
-              console.log(`🌐 Total domains: ${domains.length.toLocaleString()}`);
+            }
           }
 
-          main().catch(console.error);
+          const domains = Array.from(uniqueDomains).sort();
+          console.log(`Unique domains: ${domains.length}`);
+
+          const content = domains.join('\n');
+          mkdirSync('./output', { recursive: true });
+          writeFileSync('./output/blocklist.txt', content);
+          writeFileSync('./output/blocklist.txt.gz', gzipSync(content));
+          
+          console.log('Done!');
           EOF
           
-          node builder.js
+          node index.mjs
       
       - name: Upload results
         uses: actions/upload-artifact@v4

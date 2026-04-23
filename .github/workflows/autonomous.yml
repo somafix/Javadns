@@ -12,7 +12,338 @@ jobs:
       - name: Run blocklist builder
         run: |
           cat > builder.js << 'EOF'
-          // ВСТАВИТЬ ВЕСЬ КОД СКРИПТА ЗДЕСЬ (без импорта axios, используя fetch)
+          import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
+          import { join, resolve } from 'path';
+          import { gzipSync } from 'zlib';
+          import crypto from 'crypto';
+
+          // ============================================================================
+          // CONSTANTS
+          // ============================================================================
+
+          const MIN_DOMAIN_LENGTH = 3;
+          const MAX_DOMAIN_LENGTH = 253;
+          const MAX_LABEL_LENGTH = 63;
+          const MAX_RESPONSE_SIZE_BYTES = 100 * 1024 * 1024;
+          const CACHE_TTL_MS = 86400000; // 24 часа
+
+          // ============================================================================
+          // CACHE MANAGER
+          // ============================================================================
+
+          class CacheManager {
+              private cacheDir: string;
+              
+              constructor(cacheDir: string = './cache') {
+                  this.cacheDir = cacheDir;
+                  mkdirSync(cacheDir, { recursive: true });
+              }
+              
+              private getCachePath(url: string): string {
+                  const hash = crypto.createHash('sha256').update(url).digest('hex');
+                  return join(this.cacheDir, `${hash}.cache`);
+              }
+              
+              get(url: string): string | null {
+                  try {
+                      const cachePath = this.getCachePath(url);
+                      if (!existsSync(cachePath)) return null;
+                      
+                      const stats = require('fs').statSync(cachePath);
+                      if (Date.now() - stats.mtimeMs > CACHE_TTL_MS) return null;
+                      
+                      return readFileSync(cachePath, 'utf8');
+                  } catch {
+                      return null;
+                  }
+              }
+              
+              set(url: string, data: string): void {
+                  try {
+                      const cachePath = this.getCachePath(url);
+                      writeFileSync(cachePath, data, 'utf8');
+                  } catch (error) {
+                      console.warn(`Failed to write cache: ${(error as Error).message}`);
+                  }
+              }
+          }
+
+          // ============================================================================
+          // FETCH MANAGER (using native fetch)
+          // ============================================================================
+
+          class FetchManager {
+              private cache: CacheManager;
+              
+              constructor() {
+                  this.cache = new CacheManager();
+              }
+              
+              async fetch(url: string, sourceName: string): Promise<string> {
+                  const cached = this.cache.get(url);
+                  if (cached) {
+                      console.log(`✓ Using cached ${sourceName}`);
+                      return cached;
+                  }
+                  
+                  const controller = new AbortController();
+                  const timeoutId = setTimeout(() => controller.abort(), 30000);
+                  
+                  try {
+                      const response = await fetch(url, {
+                          signal: controller.signal,
+                          headers: {
+                              'User-Agent': 'DNS-Blocklist-Builder/6.0',
+                          }
+                      });
+                      
+                      clearTimeout(timeoutId);
+                      
+                      if (!response.ok) {
+                          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                      }
+                      
+                      const data = await response.text();
+                      
+                      if (data.length > MAX_RESPONSE_SIZE_BYTES) {
+                          throw new Error(`Response too large: ${data.length} bytes`);
+                      }
+                      
+                      this.cache.set(url, data);
+                      console.log(`✓ Downloaded ${sourceName} (${(data.length / 1024 / 1024).toFixed(2)} MB)`);
+                      
+                      return data;
+                  } catch (error) {
+                      clearTimeout(timeoutId);
+                      throw new Error(`Failed to fetch ${sourceName}: ${(error as Error).message}`);
+                  }
+              }
+          }
+
+          // ============================================================================
+          // DOMAIN VALIDATOR
+          // ============================================================================
+
+          class DomainValidator {
+              private static readonly DOMAIN_REGEX = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i;
+              
+              validate(domain: string): { isValid: boolean; normalized: string | null } {
+                  if (!domain || typeof domain !== 'string') {
+                      return { isValid: false, normalized: null };
+                  }
+                  
+                  let normalized = domain.normalize('NFKC').toLowerCase().trim();
+                  
+                  if (normalized.endsWith('.')) {
+                      normalized = normalized.slice(0, -1);
+                  }
+                  
+                  if (normalized.length < MIN_DOMAIN_LENGTH || normalized.length > MAX_DOMAIN_LENGTH) {
+                      return { isValid: false, normalized: null };
+                  }
+                  
+                  if (normalized.startsWith('xn--')) {
+                      return { isValid: false, normalized: null };
+                  }
+                  
+                  const labels = normalized.split('.');
+                  if (labels.length > 127) {
+                      return { isValid: false, normalized: null };
+                  }
+                  
+                  for (const label of labels) {
+                      if (label.length === 0 || label.length > MAX_LABEL_LENGTH) {
+                          return { isValid: false, normalized: null };
+                      }
+                      
+                      if (label.startsWith('-') || label.endsWith('-')) {
+                          return { isValid: false, normalized: null };
+                      }
+                      
+                      if (!DomainValidator.DOMAIN_REGEX.test(label)) {
+                          return { isValid: false, normalized: null };
+                      }
+                  }
+                  
+                  return { isValid: true, normalized };
+              }
+          }
+
+          // ============================================================================
+          // DEDUPLICATION ENGINE
+          // ============================================================================
+
+          class DeduplicationEngine {
+              private domains: Map<string, number> = new Map();
+              private totalProcessed = 0;
+              
+              add(domain: string): boolean {
+                  this.totalProcessed++;
+                  
+                  if (this.domains.has(domain)) {
+                      this.domains.set(domain, (this.domains.get(domain) || 0) + 1);
+                      return false;
+                  }
+                  
+                  this.domains.set(domain, 1);
+                  return true;
+              }
+              
+              getAll(): string[] {
+                  return Array.from(this.domains.keys()).sort();
+              }
+              
+              getStats(): { unique: number; total: number; duplicateRate: number } {
+                  return {
+                      unique: this.domains.size,
+                      total: this.totalProcessed,
+                      duplicateRate: this.totalProcessed > 0 
+                          ? ((this.totalProcessed - this.domains.size) / this.totalProcessed) * 100 
+                          : 0,
+                  };
+              }
+          }
+
+          // ============================================================================
+          // DOMAIN PARSER
+          // ============================================================================
+
+          class DomainParser {
+              private static readonly HOSTS_IPS = new Set(['0.0.0.0', '127.0.0.1', '::1', '0']);
+              
+              static parse(content: string): string[] {
+                  const domains: string[] = [];
+                  const lines = content.split(/\r?\n/);
+                  
+                  for (const line of lines) {
+                      const trimmed = line.trim();
+                      
+                      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) {
+                          continue;
+                      }
+                      
+                      const parts = trimmed.split(/\s+/);
+                      if (parts.length >= 2 && DomainParser.HOSTS_IPS.has(parts[0])) {
+                          const domain = parts[1].toLowerCase();
+                          if (this.isValidDomainFormat(domain)) {
+                              domains.push(domain);
+                          }
+                      } else if (this.isValidDomainFormat(trimmed)) {
+                          domains.push(trimmed.toLowerCase());
+                      }
+                  }
+                  
+                  return domains;
+              }
+              
+              private static isValidDomainFormat(domain: string): boolean {
+                  return /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i.test(domain) && domain.length <= MAX_DOMAIN_LENGTH;
+              }
+          }
+
+          // ============================================================================
+          // OUTPUT GENERATOR
+          // ============================================================================
+
+          class OutputGenerator {
+              static generate(domains: string[], format: 'hosts' | 'domains'): string {
+                  const header = this.generateHeader(domains.length);
+                  let content = header;
+                  
+                  if (format === 'hosts') {
+                      for (const domain of domains) {
+                          content += `0.0.0.0 ${domain}\n`;
+                          content += `:: ${domain}\n`;
+                      }
+                  } else {
+                      content += domains.join('\n');
+                  }
+                  
+                  return content;
+              }
+              
+              private static generateHeader(domainCount: number): string {
+                  const now = new Date().toISOString();
+                  return `# DNS Blocklist v6.0
+          # Generated: ${now}
+          # Total Domains: ${domainCount.toLocaleString()}
+          # ============================================================================
+
+          `;
+              }
+              
+              static write(content: string, outputDir: string, format: string): string {
+                  const outputPath = resolve(outputDir, `blocklist.${format === 'hosts' ? 'txt' : 'domains'}`);
+                  mkdirSync(outputDir, { recursive: true });
+                  
+                  writeFileSync(outputPath, content, 'utf8');
+                  console.log(`✓ Written to ${outputPath}`);
+                  
+                  const gzipPath = `${outputPath}.gz`;
+                  writeFileSync(gzipPath, gzipSync(content, { level: 9 }));
+                  console.log(`✓ Written compressed to ${gzipPath}`);
+                  
+                  return outputPath;
+              }
+          }
+
+          // ============================================================================
+          // MAIN BUILDER
+          // ============================================================================
+
+          const SOURCES = [
+              { name: 'OISD Big', url: 'https://big.oisd.nl/domains' },
+              { name: 'AdAway', url: 'https://adaway.org/hosts.txt' },
+              { name: 'StevenBlack', url: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts' },
+              { name: 'Peter Lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0' },
+          ];
+
+          async function main() {
+              console.log('🚀 DNS Blocklist Builder v6.0\n');
+              
+              const validator = new DomainValidator();
+              const fetcher = new FetchManager();
+              const dedupEngine = new DeduplicationEngine();
+              
+              console.log(`📡 Fetching ${SOURCES.length} sources...\n`);
+              
+              const allDomains: string[] = [];
+              for (const source of SOURCES) {
+                  try {
+                      const content = await fetcher.fetch(source.url, source.name);
+                      const domains = DomainParser.parse(content);
+                      allDomains.push(...domains);
+                      console.log(`  → ${source.name}: ${domains.length.toLocaleString()} domains`);
+                  } catch (error) {
+                      console.error(`  ✗ ${source.name}: ${(error as Error).message}`);
+                  }
+              }
+              
+              console.log(`\n🔍 Processing ${allDomains.length.toLocaleString()} total domains...`);
+              
+              for (const domain of allDomains) {
+                  const { isValid, normalized } = validator.validate(domain);
+                  if (isValid && normalized) {
+                      dedupEngine.add(normalized);
+                  }
+              }
+              
+              const stats = dedupEngine.getStats();
+              console.log(`\n📊 Deduplication stats:`);
+              console.log(`  → Unique domains: ${stats.unique.toLocaleString()}`);
+              console.log(`  → Duplicate rate: ${stats.duplicateRate.toFixed(2)}%`);
+              
+              const domains = dedupEngine.getAll();
+              const format = domains.length > 500000 ? 'domains' : 'hosts';
+              const content = OutputGenerator.generate(domains, format);
+              const outputPath = OutputGenerator.write(content, './output', format);
+              
+              console.log(`\n✅ Build completed!`);
+              console.log(`📁 Output: ${outputPath}`);
+              console.log(`🌐 Total domains: ${domains.length.toLocaleString()}`);
+          }
+
+          main().catch(console.error);
           EOF
           
           node builder.js

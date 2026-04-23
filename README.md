@@ -1,41 +1,28 @@
-# DNS Blocklist Builder
+# DNS Blocklist Builder 🚀
 
-[![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue.svg)](https://www.typescriptlang.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/somafix/Javadns/autonomous.yml?branch=main&label=Build&logo=github)](https://github.com/somafix/Javadns/actions)
+[![Node.js Version](https://img.shields.io/badge/node-%3E%3D14.0.0-brightgreen?logo=node.js)](https://nodejs.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-prettier-ff69b4.svg)](https://prettier.io/)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Coverage](https://img.shields.io/badge/coverage-85%25-yellowgreen.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
+[![Downloads](https://img.shields.io/npm/dt/dns-blocklist-builder.svg)](https://www.npmjs.com/package/dns-blocklist-builder)
 
-A production-ready, high-performance DNS blocklist builder with advanced features including circuit breakers, retry logic, SSRF protection, caching, and graceful shutdown.
+> 🛡️ A powerful, production-ready DNS blocklist builder that aggregates, validates, and deduplicates domains from multiple sources. Perfect for Pi-hole, AdGuard Home, and other DNS filtering solutions.
 
-## 🚀 Features
+## ✨ Features
 
-- **Multi-Source Aggregation** - Combine multiple blocklist sources
-- **Intelligent Deduplication** - Bloom filter + LRU cache for memory-efficient dedup
-- **Automatic Caching** - Reduce network usage with smart caching (24h TTL)
-- **Circuit Breaker Pattern** - Prevents cascading failures
-- **SSRF Protection** - Blocks requests to private IP ranges
-- **Graceful Shutdown** - Proper cleanup on SIGTERM/SIGINT
-- **Domain Validation** - RFC-compliant domain validation with risk scoring
-- **Multiple Output Formats** - Hosts file format or plain domains list
-- **Compression Support** - Automatic GZip compression for outputs
-- **Comprehensive Logging** - Structured logging with Pino
-- **Metrics Collection** - Built-in performance metrics
+- 🔄 **Multi-source aggregation** - Combines blocklists from OISD, AdAway, StevenBlack, Peter Lowe, and more
+- 🗜️ **Smart deduplication** - Removes duplicate entries with detailed statistics
+- ✅ **Domain validation** - RFC-compliant domain validation with punycode blocking
+- 💾 **Local caching** - 24-hour cache to reduce bandwidth and speed up subsequent runs
+- 🔁 **Automatic retries** - Exponential backoff for failed downloads
+- 📦 **Dual output formats** - Generates both hosts format and plain domains list
+- 🗜️ **Gzip compression** - Automatically creates compressed versions for efficient distribution
+- 🤖 **CI/CD ready** - Built-in GitHub Actions workflow for automated daily builds
+- 📊 **Detailed statistics** - Shows duplicate rates, domain counts, and processing time
+- 
 
-
-## 📦 Installation
+### Global Installation
 
 ```bash
-# Using npm
-npm install dns-blocklist-builder
-
-# Using yarn
-yarn add dns-blocklist-builder
-
-# Using pnpm
-pnpm add dns-blocklist-builder
-
-# Global installation (for CLI usage)
 npm install -g dns-blocklist-builder

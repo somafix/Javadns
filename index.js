@@ -1,16 +1,10 @@
 #!/usr/bin/env node
 
-import { writeFileSync, mkdirSync, existsSync, readFileSync, promises as fsPromises } from 'fs';
+import { writeFileSync, mkdirSync, readFileSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
-import { gzipSync, brotliCompressSync } from 'zlib';
+import { gzipSync } from 'zlib';
 import crypto from 'crypto';
-import { Mutex } from 'async-mutex';
-import pino from 'pino';
-import axios, { AxiosInstance, AxiosError } from 'axios';
-import { BloomFilter } from 'bloom-filters';
-import dns from 'dns';
-import { promisify } from 'util';
-import os from 'os';
+import axios, { AxiosError } from 'axios';
 
 // ============================================================================
 // CONSTANTS
@@ -19,352 +13,125 @@ import os from 'os';
 const MIN_DOMAIN_LENGTH = 3;
 const MAX_DOMAIN_LENGTH = 253;
 const MAX_LABEL_LENGTH = 63;
-const DEFAULT_BUFFER_SIZE = 256 * 1024;
-const MAX_RESPONSE_SIZE_MB = 100;
-const MAX_RESPONSE_SIZE_BYTES = MAX_RESPONSE_SIZE_MB * 1024 * 1024;
-const DECOMPRESSION_RATIO_LIMIT = 10;
-const MAX_DECOMPRESSED_SIZE = MAX_RESPONSE_SIZE_BYTES * DECOMPRESSION_RATIO_LIMIT;
+const MAX_RESPONSE_SIZE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_RETRY_ATTEMPTS = 3;
-const RETRY_BASE_DELAY_MS = 1000;
-const RETRY_MAX_DELAY_MS = 30000;
-const CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5;
-const CIRCUIT_BREAKER_TIMEOUT_MS = 60000;
-const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 30000;
-const WORKER_COUNT = Math.max(1, Math.min(os.cpus().length, 8));
+const RETRY_DELAY_MS = 1000;
+const CACHE_TTL_MS = 86400000; // 24 часа
 
 // ============================================================================
-// INTERFACES
+// RETRY LOGIC
 // ============================================================================
 
-interface Logger {
-    debug(msg: string, args?: Record<string, unknown>): void;
-    info(msg: string, args?: Record<string, unknown>): void;
-    warn(msg: string, args?: Record<string, unknown>): void;
-    error(msg: string, err?: Error, args?: Record<string, unknown>): void;
-}
-
-interface Metrics {
-    recordDuration(name: string, durationMs: number, labels?: Record<string, string>): void;
-    recordCounter(name: string, value: number, labels?: Record<string, string>): void;
-    recordGauge(name: string, value: number, labels?: Record<string, string>): void;
-}
-
-interface SourceConfig {
-    name: string;
-    url: string;
-    enabled: boolean;
-    timeout?: number;
-    retries?: number;
-}
-
-interface ValidationContext {
-    maxLabels: number;
-    blockPunycode: boolean;
-    maxRiskScore: number;
-}
-
-interface DomainMetadata {
-    domain: string;
-    source: string;
-    firstSeen: number;
-    occurrences: number;
-}
-
-interface BuildResult {
-    success: boolean;
-    duration?: number;
-    domainCount?: number;
-    outputPath?: string;
-    error?: string;
-    timestamp: string;
-}
-
-interface DedupStats {
-    uniqueDomains: number;
-    totalProcessed: number;
-    duplicateRate: number;
-}
-
-interface ProcessResult {
-    domains: string[];
-    stats: DedupStats;
-}
-
-interface FetchResult {
-    data: string;
-    sourceName: string;
-    fetchTimeMs: number;
-    cached: boolean;
-}
-
-// ============================================================================
-// NOOP IMPLEMENTATIONS FOR TESTING
-// ============================================================================
-
-class NoopLogger implements Logger {
-    debug(_msg: string, _args?: Record<string, unknown>): void {}
-    info(_msg: string, _args?: Record<string, unknown>): void {}
-    warn(_msg: string, _args?: Record<string, unknown>): void {}
-    error(_msg: string, _err?: Error, _args?: Record<string, unknown>): void {}
-}
-
-class NoopMetrics implements Metrics {
-    recordDuration(_name: string, _durationMs: number, _labels?: Record<string, string>): void {}
-    recordCounter(_name: string, _value: number, _labels?: Record<string, string>): void {}
-    recordGauge(_name: string, _value: number, _labels?: Record<string, string>): void {}
-}
-
-// ============================================================================
-// CIRCUIT BREAKER
-// ============================================================================
-
-class CircuitBreaker {
-    private failures = 0;
-    private lastFailureTime = 0;
-    private state: 'closed' | 'open' | 'half-open' = 'closed';
-    private readonly failureThreshold: number;
-    private readonly timeoutMs: number;
-
-    constructor(failureThreshold: number = CIRCUIT_BREAKER_FAILURE_THRESHOLD, timeoutMs: number = CIRCUIT_BREAKER_TIMEOUT_MS) {
-        this.failureThreshold = failureThreshold;
-        this.timeoutMs = timeoutMs;
-    }
-
-    async execute<T>(fn: () => Promise<T>): Promise<T> {
-        if (this.state === 'open') {
-            if (Date.now() - this.lastFailureTime > this.timeoutMs) {
-                this.state = 'half-open';
-            } else {
-                throw new Error('Circuit breaker is open');
-            }
-        }
-
+async function withRetry<T>(
+    fn: () => Promise<T>,
+    maxAttempts: number = DEFAULT_RETRY_ATTEMPTS
+): Promise<T> {
+    let lastError: Error = new Error('Unknown error');
+    
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const result = await fn();
-            if (this.state === 'half-open') {
-                this.reset();
-            }
-            return result;
+            return await fn();
         } catch (error) {
-            this.recordFailure();
-            throw error;
-        }
-    }
-
-    private recordFailure(): void {
-        this.failures++;
-        this.lastFailureTime = Date.now();
-        if (this.failures >= this.failureThreshold) {
-            this.state = 'open';
-        }
-    }
-
-    private reset(): void {
-        this.failures = 0;
-        this.state = 'closed';
-    }
-
-    getState(): string {
-        return this.state;
-    }
-}
-
-// ============================================================================
-// SSRF PROTECTION
-// ============================================================================
-
-class SSRFProtector {
-    private static readonly PRIVATE_IP_RANGES = [
-        /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
-        /^172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}$/,
-        /^192\.168\.\d{1,3}\.\d{1,3}$/,
-        /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/,
-        /^169\.254\.\d{1,3}\.\d{1,3}$/,
-        /^::1$/,
-        /^fc00:/,
-        /^fe80:/
-    ];
-
-    static async validate(url: URL): Promise<void> {
-        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            throw new Error(`Unsupported protocol: ${url.protocol}`);
-        }
-
-        const lookupPromise = promisify(dns.lookup);
-        const { address } = await lookupPromise(url.hostname);
-        
-        for (const pattern of this.PRIVATE_IP_RANGES) {
-            if (pattern.test(address)) {
-                throw new Error(`Blocked private IP: ${address} for hostname ${url.hostname}`);
+            lastError = error as Error;
+            
+            if (attempt === maxAttempts) {
+                throw lastError;
             }
+            
+            console.warn(`Retry attempt ${attempt}/${maxAttempts}: ${lastError.message}`);
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * attempt));
         }
     }
+    
+    throw lastError;
 }
 
 // ============================================================================
-// RETRY WITH EXPONENTIAL BACKOFF
+// CACHE MANAGER
 // ============================================================================
 
-class RetryHandler {
-    static async withRetry<T>(
-        fn: () => Promise<T>,
-        maxAttempts: number = DEFAULT_RETRY_ATTEMPTS,
-        baseDelayMs: number = RETRY_BASE_DELAY_MS,
-        logger?: Logger
-    ): Promise<T> {
-        let lastError: Error = new Error('Unknown error');
-        
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            try {
-                return await fn();
-            } catch (error) {
-                lastError = error as Error;
-                
-                if (attempt === maxAttempts) {
-                    throw lastError;
-                }
-                
-                const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
-                const jitter = delay * 0.1 * Math.random();
-                
-                if (logger) {
-                    logger.warn(`Retry attempt ${attempt}/${maxAttempts} after ${delay + jitter}ms`, {
-                        error: lastError.message
-                    });
-                }
-                
-                await new Promise(resolve => setTimeout(resolve, delay + jitter));
-            }
-        }
-        
-        throw lastError;
-    }
-}
-
-// ============================================================================
-// FETCH MANAGER WITH RETRY, CIRCUIT BREAKER & SSRF PROTECTION
-// ============================================================================
-
-class FetchManager {
-    private axiosInstance: AxiosInstance;
-    private logger: Logger;
-    private metrics: Metrics;
-    private circuitBreaker: CircuitBreaker;
+class CacheManager {
     private cacheDir: string;
-    private readonly cacheTTLMs: number = 86400000;
-
-    constructor(logger: Logger, metrics: Metrics, cacheDir: string = './cache') {
-        this.logger = logger;
-        this.metrics = metrics;
-        this.circuitBreaker = new CircuitBreaker();
+    
+    constructor(cacheDir: string = './cache') {
         this.cacheDir = cacheDir;
-        
-        this.axiosInstance = axios.create({
-            timeout: 30000,
-            maxRedirects: 5,
-            maxContentLength: MAX_RESPONSE_SIZE_BYTES,
-            validateStatus: (status) => status === 200,
-            headers: {
-                'User-Agent': 'DNS-Blocklist-Builder/6.0',
-                'Accept': 'text/plain, text/html',
-                'Accept-Encoding': 'gzip, deflate',
-            },
-        });
-        
         mkdirSync(cacheDir, { recursive: true });
     }
-
+    
     private getCachePath(url: string): string {
         const hash = crypto.createHash('sha256').update(url).digest('hex');
         return join(this.cacheDir, `${hash}.cache`);
     }
-
-    private async readFromCache(url: string): Promise<string | null> {
+    
+    get(url: string): string | null {
         try {
             const cachePath = this.getCachePath(url);
-            const stats = await fsPromises.stat(cachePath);
+            if (!existsSync(cachePath)) return null;
             
-            if (Date.now() - stats.mtimeMs > this.cacheTTLMs) {
-                return null;
-            }
+            const stats = require('fs').statSync(cachePath);
+            if (Date.now() - stats.mtimeMs > CACHE_TTL_MS) return null;
             
-            return await fsPromises.readFile(cachePath, 'utf8');
+            return readFileSync(cachePath, 'utf8');
         } catch {
             return null;
         }
     }
-
-    private async writeToCache(url: string, data: string): Promise<void> {
+    
+    set(url: string, data: string): void {
         try {
             const cachePath = this.getCachePath(url);
-            await fsPromises.writeFile(cachePath, data, 'utf8');
+            writeFileSync(cachePath, data, 'utf8');
         } catch (error) {
-            this.logger.warn('Failed to write cache', { url, error: (error as Error).message });
+            console.warn(`Failed to write cache: ${(error as Error).message}`);
         }
     }
+}
 
-    async fetch(url: string, sourceName: string, timeout?: number): Promise<FetchResult> {
-        const startTime = Date.now();
-        const urlObj = new URL(url);
-        
-        await SSRFProtector.validate(urlObj);
-        
-        const cached = await this.readFromCache(url);
+// ============================================================================
+// FETCH MANAGER
+// ============================================================================
+
+class FetchManager {
+    private cache: CacheManager;
+    
+    constructor() {
+        this.cache = new CacheManager();
+    }
+    
+    async fetch(url: string, sourceName: string): Promise<string> {
+        // Проверяем кэш
+        const cached = this.cache.get(url);
         if (cached) {
-            this.metrics.recordCounter('fetch.cache_hit', 1, { source: sourceName });
-            return {
-                data: cached,
-                sourceName,
-                fetchTimeMs: 0,
-                cached: true
-            };
+            console.log(`✓ Using cached ${sourceName}`);
+            return cached;
         }
         
-        try {
-            const result = await RetryHandler.withRetry(async () => {
-                return await this.circuitBreaker.execute(async () => {
-                    const response = await this.axiosInstance.get(url, {
-                        timeout: timeout || 30000,
-                        signal: AbortSignal.timeout(timeout || 30000),
-                    });
-                    
-                    if (response.data.length > MAX_RESPONSE_SIZE_BYTES) {
-                        throw new Error(`Response too large: ${response.data.length} bytes`);
-                    }
-                    
-                    return response;
-                });
-            }, 3, RETRY_BASE_DELAY_MS, this.logger);
+        // Скачиваем с ретраями
+        const response = await withRetry(async () => {
+            const res = await axios.get(url, {
+                timeout: 30000,
+                maxRedirects: 5,
+                maxContentLength: MAX_RESPONSE_SIZE_BYTES,
+                headers: {
+                    'User-Agent': 'DNS-Blocklist-Builder/6.0',
+                    'Accept-Encoding': 'gzip, deflate',
+                },
+                // Для Node.js 14-16: без AbortSignal.timeout
+                // Используем просто timeout в axios
+            });
             
-            const fetchTimeMs = Date.now() - startTime;
-            
-            await this.writeToCache(url, result.data);
-            
-            this.metrics.recordDuration('fetch.duration', fetchTimeMs, { source: sourceName });
-            this.metrics.recordCounter('fetch.bytes', result.data.length, { source: sourceName });
-            
-            return {
-                data: result.data,
-                sourceName,
-                fetchTimeMs,
-                cached: false
-            };
-        } catch (error) {
-            this.metrics.recordCounter('fetch.errors', 1, { source: sourceName, error: (error as Error).message });
-            
-            const fallback = await this.readFromCache(url);
-            if (fallback) {
-                this.logger.warn(`Using cached fallback for ${sourceName}`, { error: (error as Error).message });
-                return {
-                    data: fallback,
-                    sourceName,
-                    fetchTimeMs: 0,
-                    cached: true
-                };
+            if (typeof res.data !== 'string') {
+                throw new Error(`Invalid response type for ${sourceName}`);
             }
             
-            throw new Error(`Failed to fetch ${sourceName}: ${(error as Error).message}`);
-        }
+            return res.data;
+        });
+        
+        // Сохраняем в кэш
+        this.cache.set(url, response);
+        console.log(`✓ Downloaded ${sourceName} (${(response.length / 1024 / 1024).toFixed(2)} MB)`);
+        
+        return response;
     }
 }
 
@@ -374,200 +141,90 @@ class FetchManager {
 
 class DomainValidator {
     private static readonly DOMAIN_REGEX = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/i;
-    private static readonly CONFUSABLE_MAP = new Map<string, string>([
-        ['а', 'a'], ['е', 'e'], ['о', 'o'], ['р', 'p'], ['с', 'c'],
-        ['х', 'x'], ['у', 'y'], ['к', 'k'], ['в', 'b'], ['н', 'h']
-    ]);
-
-    validate(domain: string, context: ValidationContext): { isValid: boolean; normalized: string | null; riskScore: number } {
+    
+    validate(domain: string): { isValid: boolean; normalized: string | null } {
         if (!domain || typeof domain !== 'string') {
-            return { isValid: false, normalized: null, riskScore: 100 };
+            return { isValid: false, normalized: null };
         }
-
+        
         let normalized = domain.normalize('NFKC').toLowerCase().trim();
         
+        // Убираем точку в конце
         if (normalized.endsWith('.')) {
             normalized = normalized.slice(0, -1);
         }
-
+        
+        // Проверка длины
         if (normalized.length < MIN_DOMAIN_LENGTH || normalized.length > MAX_DOMAIN_LENGTH) {
-            return { isValid: false, normalized: null, riskScore: 100 };
+            return { isValid: false, normalized: null };
         }
-
-        if (context.blockPunycode && normalized.startsWith('xn--')) {
-            return { isValid: false, normalized: null, riskScore: 100 };
+        
+        // Блокируем punycode (опционально)
+        if (normalized.startsWith('xn--')) {
+            return { isValid: false, normalized: null };
         }
-
+        
+        // Проверяем каждый лейбл
         const labels = normalized.split('.');
-        if (labels.length > context.maxLabels) {
-            return { isValid: false, normalized: null, riskScore: 100 };
+        if (labels.length > 127) {
+            return { isValid: false, normalized: null };
         }
-
-        let riskScore = 0;
         
         for (const label of labels) {
             if (label.length === 0 || label.length > MAX_LABEL_LENGTH) {
-                return { isValid: false, normalized: null, riskScore: 100 };
+                return { isValid: false, normalized: null };
             }
             
             if (label.startsWith('-') || label.endsWith('-')) {
-                return { isValid: false, normalized: null, riskScore: 100 };
+                return { isValid: false, normalized: null };
             }
             
             if (!DomainValidator.DOMAIN_REGEX.test(label)) {
-                return { isValid: false, normalized: null, riskScore: 100 };
-            }
-            
-            if (this.hasConfusableCharacters(label)) {
-                riskScore += 20;
+                return { isValid: false, normalized: null };
             }
         }
-
-        const isValid = riskScore < context.maxRiskScore;
-        return { isValid, normalized: isValid ? normalized : null, riskScore };
-    }
-
-    private hasConfusableCharacters(label: string): boolean {
-        for (const [confusable] of DomainValidator.CONFUSABLE_MAP) {
-            if (label.includes(confusable)) return true;
-        }
-        return false;
+        
+        return { isValid: true, normalized };
     }
 }
 
 // ============================================================================
-// DEDUPLICATION ENGINE WITH LRU
+// DEDUPLICATION ENGINE
 // ============================================================================
 
 class DeduplicationEngine {
-    private domains: Map<string, DomainMetadata> = new Map();
-    private bloomFilter: BloomFilter;
-    private mutex = new Mutex();
-    private readonly maxSize: number;
+    private domains: Map<string, number> = new Map();
     private totalProcessed = 0;
-
-    constructor(expectedSize: number = 5000000, maxSize: number = 10000000) {
-        this.bloomFilter = new BloomFilter(expectedSize, 0.01);
-        this.maxSize = maxSize;
-    }
-
-    private evictOldest(): void {
-        if (this.domains.size <= this.maxSize) return;
+    
+    add(domain: string): boolean {
+        this.totalProcessed++;
         
-        const entries = Array.from(this.domains.entries());
-        entries.sort((a, b) => a[1].firstSeen - b[1].firstSeen);
-        
-        const toRemove = entries.slice(0, this.domains.size - this.maxSize);
-        for (const [domain] of toRemove) {
-            this.domains.delete(domain);
-        }
-    }
-
-    async add(domain: string, source: string): Promise<boolean> {
-        const release = await this.mutex.acquire();
-        
-        try {
-            this.totalProcessed++;
-            this.evictOldest();
-            
-            if (this.bloomFilter.has(domain)) {
-                const existing = this.domains.get(domain);
-                if (existing) {
-                    existing.occurrences++;
-                    return false;
-                }
-            }
-            
-            if (!this.domains.has(domain)) {
-                this.domains.set(domain, {
-                    domain,
-                    source,
-                    firstSeen: Date.now(),
-                    occurrences: 1,
-                });
-                this.bloomFilter.add(domain);
-                return true;
-            }
-            
+        if (this.domains.has(domain)) {
+            this.domains.set(domain, (this.domains.get(domain) || 0) + 1);
             return false;
-        } finally {
-            release();
         }
+        
+        this.domains.set(domain, 1);
+        return true;
     }
-
+    
     getAll(): string[] {
         return Array.from(this.domains.keys()).sort();
     }
-
-    getStats(): DedupStats {
+    
+    getStats(): { unique: number; total: number; duplicateRate: number } {
         return {
-            uniqueDomains: this.domains.size,
-            totalProcessed: this.totalProcessed,
-            duplicateRate: this.totalProcessed > 0 ? (1 - this.domains.size / this.totalProcessed) * 100 : 0,
+            unique: this.domains.size,
+            total: this.totalProcessed,
+            duplicateRate: this.totalProcessed > 0 
+                ? ((this.totalProcessed - this.domains.size) / this.totalProcessed) * 100 
+                : 0,
         };
     }
 }
 
 // ============================================================================
-// OUTPUT GENERATOR
-// ============================================================================
-
-class OutputGenerator {
-    private static readonly VERSION = '6.0.0';
-
-    static generate(domains: string[], format: 'hosts' | 'domains'): string {
-        const header = this.generateHeader(domains.length);
-        let content = header;
-        
-        if (format === 'hosts') {
-            const batchSize = 10000;
-            for (let i = 0; i < domains.length; i += batchSize) {
-                const batch = domains.slice(i, i + batchSize);
-                for (const domain of batch) {
-                    content += `0.0.0.0 ${domain}\n`;
-                    content += `:: ${domain}\n`;
-                }
-            }
-        } else {
-            content += domains.join('\n');
-        }
-        
-        return content;
-    }
-
-    private static generateHeader(domainCount: number): string {
-        const now = new Date().toISOString();
-        return `# DNS Blocklist v${this.VERSION}
-# Generated: ${now}
-# Total Domains: ${domainCount.toLocaleString()}
-# ============================================================================
-# END OF HEADER
-# ============================================================================
-
-`;
-    }
-
-    static async write(content: string, outputDir: string, format: string, timeoutMs: number = 30000): Promise<string> {
-        const outputPath = resolve(outputDir, `blocklist.${format === 'hosts' ? 'txt' : 'domains'}`);
-        mkdirSync(outputDir, { recursive: true });
-        
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs);
-        
-        try {
-            await fsPromises.writeFile(outputPath, content, { signal: controller.signal as any });
-            const gzipPath = `${outputPath}.gz`;
-            await fsPromises.writeFile(gzipPath, gzipSync(content, { level: 9 }));
-            
-            return outputPath;
-        } finally {
-            clearTimeout(timeout);
-        }
-    }
-}
-
-// ============================================================================
-// DOMAIN PARSER WITH WORKER POOL
+// DOMAIN PARSER
 // ============================================================================
 
 class DomainParser {
@@ -580,18 +237,21 @@ class DomainParser {
         for (const line of lines) {
             const trimmed = line.trim();
             
+            // Пропускаем комментарии и пустые строки
             if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('!')) {
                 continue;
             }
             
+            // hosts формат: IP domain
             const parts = trimmed.split(/\s+/);
-            
             if (parts.length >= 2 && DomainParser.HOSTS_IPS.has(parts[0])) {
                 const domain = parts[1].toLowerCase();
-                if (DomainParser.isValidDomainFormat(domain)) {
+                if (this.isValidDomainFormat(domain)) {
                     domains.push(domain);
                 }
-            } else if (DomainParser.isValidDomainFormat(trimmed)) {
+            } 
+            // domains формат: просто домен
+            else if (this.isValidDomainFormat(trimmed)) {
                 domains.push(trimmed.toLowerCase());
             }
         }
@@ -605,212 +265,169 @@ class DomainParser {
 }
 
 // ============================================================================
+// OUTPUT GENERATOR
+// ============================================================================
+
+class OutputGenerator {
+    static generate(domains: string[], format: 'hosts' | 'domains'): string {
+        const header = this.generateHeader(domains.length);
+        let content = header;
+        
+        if (format === 'hosts') {
+            for (const domain of domains) {
+                content += `0.0.0.0 ${domain}\n`;
+                content += `:: ${domain}\n`;
+            }
+        } else {
+            content += domains.join('\n');
+        }
+        
+        return content;
+    }
+    
+    private static generateHeader(domainCount: number): string {
+        const now = new Date().toISOString();
+        return `# DNS Blocklist v6.0
+# Generated: ${now}
+# Total Domains: ${domainCount.toLocaleString()}
+# ============================================================================
+
+`;
+    }
+    
+    static write(content: string, outputDir: string, format: string): string {
+        const outputPath = resolve(outputDir, `blocklist.${format === 'hosts' ? 'txt' : 'domains'}`);
+        mkdirSync(outputDir, { recursive: true });
+        
+        // Пишем обычный файл
+        writeFileSync(outputPath, content, 'utf8');
+        console.log(`✓ Written to ${outputPath}`);
+        
+        // Пишем сжатый файл
+        const gzipPath = `${outputPath}.gz`;
+        writeFileSync(gzipPath, gzipSync(content, { level: 9 }));
+        console.log(`✓ Written compressed to ${gzipPath}`);
+        
+        return outputPath;
+    }
+}
+
+// ============================================================================
 // MAIN BUILDER
 // ============================================================================
+
+interface SourceConfig {
+    name: string;
+    url: string;
+    enabled: boolean;
+}
 
 class BlocklistBuilder {
     private validator: DomainValidator;
     private fetcher: FetchManager;
     private dedupEngine: DeduplicationEngine;
-    private logger: Logger;
-    private metrics: Metrics;
-    private shutdownRequested = false;
-
-    constructor(logger?: Logger, metrics?: Metrics) {
+    
+    constructor() {
         this.validator = new DomainValidator();
-        this.logger = logger || new NoopLogger();
-        this.metrics = metrics || new NoopMetrics();
-        this.fetcher = new FetchManager(this.logger, this.metrics);
+        this.fetcher = new FetchManager();
         this.dedupEngine = new DeduplicationEngine();
     }
-
-    async build(sources: SourceConfig[], outputDir: string = './output'): Promise<BuildResult> {
+    
+    async build(sources: SourceConfig[], outputDir: string = './output'): Promise<{
+        success: boolean;
+        domainCount?: number;
+        outputPath?: string;
+        error?: string;
+    }> {
         const startTime = Date.now();
-        const timestamp = new Date().toISOString();
-        
-        const shutdownTimeout = setTimeout(() => {
-            this.shutdownRequested = true;
-            this.logger.warn('Shutdown requested, finishing current batch...');
-        }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
         
         try {
-            const validationContext: ValidationContext = {
-                maxLabels: 127,
-                blockPunycode: true,
-                maxRiskScore: 50,
-            };
-            
+            // Фильтруем включенные источники
             const enabledSources = sources.filter(s => s.enabled);
-            this.logger.info(`Fetching ${enabledSources.length} sources...`);
+            console.log(`\n📡 Fetching ${enabledSources.length} sources...\n`);
             
-            const fetchResults = await this.fetchAllSources(enabledSources);
-            
-            if (this.shutdownRequested) {
-                throw new Error('Shutdown requested during fetch');
+            // Скачиваем все источники
+            const allDomains: string[] = [];
+            for (const source of enabledSources) {
+                try {
+                    const content = await this.fetcher.fetch(source.url, source.name);
+                    const domains = DomainParser.parse(content);
+                    allDomains.push(...domains);
+                    console.log(`  → ${source.name}: ${domains.length.toLocaleString()} domains`);
+                } catch (error) {
+                    console.error(`  ✗ ${source.name}: ${(error as Error).message}`);
+                }
             }
             
-            this.logger.info('Processing domains...');
-            const processResult = await this.processDomains(fetchResults, validationContext);
+            console.log(`\n🔍 Processing ${allDomains.length.toLocaleString()} total domains...`);
             
-            if (this.shutdownRequested) {
-                throw new Error('Shutdown requested during processing');
+            // Валидируем и дедуплицируем
+            for (const domain of allDomains) {
+                const { isValid, normalized } = this.validator.validate(domain);
+                if (isValid && normalized) {
+                    this.dedupEngine.add(normalized);
+                }
             }
             
-            this.logger.info('Generating output...');
-            const outputPath = await this.generateOutput(processResult.domains, outputDir);
+            const stats = this.dedupEngine.getStats();
+            console.log(`\n📊 Deduplication stats:`);
+            console.log(`  → Unique domains: ${stats.unique.toLocaleString()}`);
+            console.log(`  → Duplicate rate: ${stats.duplicateRate.toFixed(2)}%`);
             
-            const duration = Date.now() - startTime;
-            this.logger.info('Build completed', { duration, domainCount: processResult.domains.length });
+            // Генерируем вывод
+            const domains = this.dedupEngine.getAll();
+            const format = domains.length > 500000 ? 'domains' : 'hosts';
+            const content = OutputGenerator.generate(domains, format);
+            const outputPath = OutputGenerator.write(content, outputDir, format);
             
-            this.metrics.recordGauge('blocklist.domains', processResult.domains.length);
-            this.metrics.recordDuration('build.duration', duration);
+            const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+            console.log(`\n✅ Build completed in ${duration}s`);
             
             return {
                 success: true,
-                duration,
-                domainCount: processResult.domains.length,
+                domainCount: domains.length,
                 outputPath,
-                timestamp,
             };
         } catch (error) {
-            this.logger.error('Build failed', error as Error);
-            this.metrics.recordCounter('build.errors', 1);
-            
+            console.error(`\n❌ Build failed: ${(error as Error).message}`);
             return {
                 success: false,
                 error: (error as Error).message,
-                timestamp,
             };
-        } finally {
-            clearTimeout(shutdownTimeout);
         }
-    }
-
-    private async fetchAllSources(sources: SourceConfig[]): Promise<FetchResult[]> {
-        const results: FetchResult[] = [];
-        
-        for (const source of sources) {
-            if (this.shutdownRequested) break;
-            
-            try {
-                const result = await this.fetcher.fetch(source.url, source.name, source.timeout);
-                results.push(result);
-                this.logger.debug(`Fetched ${source.name}`, {
-                    bytes: result.data.length,
-                    timeMs: result.fetchTimeMs,
-                    cached: result.cached
-                });
-            } catch (error) {
-                this.logger.warn(`Skipping ${source.name}`, { error: (error as Error).message });
-                this.metrics.recordCounter('source.failed', 1, { source: source.name });
-            }
-        }
-        
-        if (results.length === 0) {
-            throw new Error('No sources could be fetched');
-        }
-        
-        return results;
-    }
-
-    private async processDomains(
-        fetchResults: FetchResult[],
-        validationContext: ValidationContext
-    ): Promise<ProcessResult> {
-        const allDomains: string[] = [];
-        
-        for (const result of fetchResults) {
-            const domains = DomainParser.parse(result.data);
-            allDomains.push(...domains);
-            
-            for (const domain of domains) {
-                const validation = this.validator.validate(domain, validationContext);
-                if (validation.isValid && validation.normalized) {
-                    await this.dedupEngine.add(validation.normalized, result.sourceName);
-                }
-            }
-        }
-        
-        const domains = this.dedupEngine.getAll();
-        const stats = this.dedupEngine.getStats();
-        
-        return { domains, stats };
-    }
-
-    private async generateOutput(domains: string[], outputDir: string): Promise<string> {
-        const format = domains.length > 500000 ? 'domains' : 'hosts';
-        const content = OutputGenerator.generate(domains, format);
-        return OutputGenerator.write(content, outputDir, format);
     }
 }
 
 // ============================================================================
-// MAIN ENTRY POINT WITH GRACEFUL SHUTDOWN
+// MAIN ENTRY POINT
 // ============================================================================
 
 const DEFAULT_SOURCES: SourceConfig[] = [
-    { name: 'OISD Big', url: 'https://big.oisd.nl/domains', enabled: true, timeout: 30000 },
-    { name: 'AdAway', url: 'https://adaway.org/hosts.txt', enabled: true, timeout: 30000 },
-    { name: 'StevenBlack', url: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts', enabled: true, timeout: 30000 },
-    { name: 'Peter Lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0', enabled: true, timeout: 30000 },
+    { name: 'OISD Big', url: 'https://big.oisd.nl/domains', enabled: true },
+    { name: 'AdAway', url: 'https://adaway.org/hosts.txt', enabled: true },
+    { name: 'StevenBlack', url: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts', enabled: true },
+    { name: 'Peter Lowe', url: 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0', enabled: true },
 ];
 
 async function main(): Promise<void> {
-    const logger = pino({ 
-        name: 'blocklist-builder', 
-        level: process.env.LOG_LEVEL || 'info',
-        formatters: { level: (label) => ({ level: label }) }
-    });
+    console.log('🚀 DNS Blocklist Builder v6.0\n');
     
-    const metrics: Metrics = {
-        recordDuration: (name, durationMs, labels) => logger.debug(`metric.${name}`, { durationMs, labels }),
-        recordCounter: (name, value, labels) => logger.debug(`metric.${name}`, { value, labels }),
-        recordGauge: (name, value, labels) => logger.debug(`metric.${name}`, { value, labels }),
-    };
+    const builder = new BlocklistBuilder();
+    const result = await builder.build(DEFAULT_SOURCES);
     
-    const builder = new BlocklistBuilder(logger, metrics);
-    
-    let shuttingDown = false;
-    const shutdownHandler = async (signal: string) => {
-        if (shuttingDown) return;
-        shuttingDown = true;
-        
-        logger.warn(`Received ${signal}, shutting down gracefully...`);
-        
-        const timeout = setTimeout(() => {
-            logger.error('Graceful shutdown timeout, forcing exit');
-            process.exit(1);
-        }, GRACEFUL_SHUTDOWN_TIMEOUT_MS);
-        
-        try {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            process.exit(0);
-        } finally {
-            clearTimeout(timeout);
-        }
-    };
-    
-    process.on('SIGTERM', () => shutdownHandler('SIGTERM'));
-    process.on('SIGINT', () => shutdownHandler('SIGINT'));
-    
-    try {
-        const result = await builder.build(DEFAULT_SOURCES);
-        
-        if (result.success) {
-            logger.info({ duration: result.duration, domainCount: result.domainCount }, 'Build successful');
-            process.exit(0);
-        } else {
-            logger.error({ error: result.error }, 'Build failed');
-            process.exit(1);
-        }
-    } catch (error) {
-        logger.error({ error: (error as Error).message }, 'Fatal error');
+    if (result.success) {
+        console.log(`\n📁 Output: ${result.outputPath}`);
+        console.log(`🌐 Total domains: ${result.domainCount?.toLocaleString()}`);
+        process.exit(0);
+    } else {
+        console.error(`\n💥 Error: ${result.error}`);
         process.exit(1);
     }
 }
 
+// Запускаем только если файл выполняется напрямую
 if (import.meta.url === `file://${process.argv[1]}`) {
-    main();
+    main().catch(console.error);
 }
 
 export { BlocklistBuilder, DomainValidator, DeduplicationEngine, OutputGenerator };

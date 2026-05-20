@@ -3,156 +3,279 @@
 import { writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { gzipSync } from 'zlib';
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 
-const MAX_DOMAIN_LEN = 253;
+const CONFIG = {
+    MAX_DOMAIN_LEN: 253,
+    MAX_LABEL_LEN: 63,
+    MAX_LABELS: 127,
+    CACHE_TTL_MS: 86400000, // 24 hours
+    REQUEST_TIMEOUT_MS: 30000,
+    MAX_RETRIES: 3,
+    RETRY_DELAY_MS: 1000,
+    HOSTS_FORMAT_THRESHOLD: 500000,
+    OUTPUT_DIR: './output',
+    OUTPUT_FILE: 'blocklist.txt',
+    GZIP_FILE: 'blocklist.txt.gz'
+} as const;
+
 const SOURCES = [
     'https://big.oisd.nl/domains',
     'https://adaway.org/hosts.txt',
     'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
     'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0'
-];
+] as const;
+
+const LOOPBACK_IPS = new Set(['0.0.0.0', '127.0.0.1', '::1', '0']);
+
+interface CacheEntry {
+    data: string;
+    timestamp: number;
+}
 
 class Downloader {
-    private cache = new Map<string, { data: string; time: number }>();
-    
-    private isExpired(time: number): boolean {
-        return Date.now() - time > 86400000;
+    private cache = new Map<string, CacheEntry>();
+
+    private isExpired(timestamp: number): boolean {
+        return Date.now() - timestamp > CONFIG.CACHE_TTL_MS;
     }
-    
+
     private cleanCache(): void {
-        for (const [url, { time }] of this.cache) {
-            if (this.isExpired(time)) this.cache.delete(url);
-        }
-    }
-    
-    async get(url: string): Promise<string> {
-        this.cleanCache();
-        
-        const cached = this.cache.get(url);
-        if (cached) return cached.data;
-        
-        for (let attempt = 1; attempt <= 3; attempt++) {
-            try {
-                const res = await axios.get(url, { timeout: 30000 });
-                if (typeof res.data === 'string') {
-                    this.cache.set(url, { data: res.data, time: Date.now() });
-                    return res.data;
-                }
-            } catch {
-                if (attempt === 3) throw new Error(`Failed to download ${url}`);
-                await new Promise(r => setTimeout(r, 1000 * attempt));
+        for (const [url, { timestamp }] of this.cache) {
+            if (this.isExpired(timestamp)) {
+                this.cache.delete(url);
             }
         }
-        throw new Error(`Failed to download ${url}`);
+    }
+
+    private async delay(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async get(url: string): Promise<string> {
+        this.cleanCache();
+
+        const cached = this.cache.get(url);
+        if (cached) return cached.data;
+
+        let lastError: Error | undefined;
+
+        for (let attempt = 1; attempt <= CONFIG.MAX_RETRIES; attempt++) {
+            try {
+                const response = await axios.get<string>(url, { 
+                    timeout: CONFIG.REQUEST_TIMEOUT_MS 
+                });
+                
+                if (typeof response.data === 'string') {
+                    this.cache.set(url, { 
+                        data: response.data, 
+                        timestamp: Date.now() 
+                    });
+                    return response.data;
+                }
+                
+                throw new Error('Response is not a string');
+            } catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                
+                if (attempt === CONFIG.MAX_RETRIES) {
+                    throw new Error(`Failed to download ${url}: ${lastError.message}`);
+                }
+                
+                await this.delay(CONFIG.RETRY_DELAY_MS * attempt);
+            }
+        }
+
+        throw lastError || new Error(`Failed to download ${url}`);
     }
 }
 
 function validateDomain(domain: string): string | null {
-    let d = domain.toLowerCase().trim();
-    if (d.endsWith('.')) d = d.slice(0, -1);
-    if (d.length < 3 || d.length > MAX_DOMAIN_LEN) return null;
+    let normalized = domain.toLowerCase().trim();
     
-    const parts = d.split('.');
-    if (parts.length > 127) return null;
-    
-    for (const part of parts) {
-        if (part.length === 0 || part.length > 63) return null;
-        if (part[0] === '-' || part[part.length - 1] === '-') return null;
-        if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(part)) return null;
+    if (normalized.endsWith('.')) {
+        normalized = normalized.slice(0, -1);
     }
-    return d;
+    
+    if (normalized.length < 3 || normalized.length > CONFIG.MAX_DOMAIN_LEN) {
+        return null;
+    }
+    
+    const labels = normalized.split('.');
+    if (labels.length > CONFIG.MAX_LABELS) {
+        return null;
+    }
+    
+    for (const label of labels) {
+        if (label.length === 0 || label.length > CONFIG.MAX_LABEL_LEN) {
+            return null;
+        }
+        
+        if (label[0] === '-' || label[label.length - 1] === '-') {
+            return null;
+        }
+        
+        if (!/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(label)) {
+            return null;
+        }
+    }
+    
+    return normalized;
 }
 
 function parseHostsLine(line: string): string | null {
     const trimmed = line.trim();
-    if (!trimmed || trimmed[0] === '#' || trimmed[0] === '!') return null;
+    
+    if (!trimmed || trimmed[0] === '#' || trimmed[0] === '!') {
+        return null;
+    }
     
     const parts = trimmed.split(/\s+/);
-    const ips = new Set(['0.0.0.0', '127.0.0.1', '::1', '0']);
     
-    if (parts.length >= 2 && ips.has(parts[0])) {
+    // Hosts format: IP domain
+    if (parts.length >= 2 && LOOPBACK_IPS.has(parts[0])) {
         return parts[1].toLowerCase();
     }
     
-    if (parts.length === 1 && trimmed.length <= MAX_DOMAIN_LEN) {
+    // Plain domain format
+    if (parts.length === 1 && trimmed.length <= CONFIG.MAX_DOMAIN_LEN) {
         return trimmed.toLowerCase();
     }
     
     return null;
 }
 
-async function downloadSource(url: string, index: number, total: number): Promise<string[]> {
-    const downloader = new Downloader();
+async function downloadSource(
+    url: string, 
+    index: number, 
+    total: number,
+    downloader: Downloader
+): Promise<string[]> {
+    const sourceName = new URL(url).hostname;
+    process.stdout.write(`[${index}/${total}] ${sourceName}... `);
+    
     try {
-        process.stdout.write(`[${index}/${total}] ${url.split('/')[2]}... `);
         const content = await downloader.get(url);
-        const domains = content.split(/\r?\n/)
+        const domains = content
+            .split(/\r?\n/)
             .map(line => parseHostsLine(line))
-            .filter((d): d is string => d !== null);
+            .filter((domain): domain is string => domain !== null);
+        
         console.log(`${domains.length.toLocaleString()} domains`);
         return domains;
     } catch (error) {
-        console.log(`Failed`);
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`Failed: ${message}`);
         return [];
     }
 }
 
-async function main(): Promise<void> {
-    console.log('\n🚀 DNS Blocklist Builder\n');
-    
-    const startTime = Date.now();
-    const downloads = SOURCES.map((url, i) => downloadSource(url, i + 1, SOURCES.length));
-    const allDomains = (await Promise.all(downloads)).flat();
-    
-    console.log(`\n📥 Total downloaded: ${allDomains.length.toLocaleString()}`);
-    
-    console.log(`\n🔍 Processing...`);
+interface Statistics {
+    totalDownloaded: number;
+    validUnique: number;
+    duplicateCount: number;
+    invalidCount: number;
+    duplicateRate: string;
+}
+
+function processDomains(allDomains: string[]): Statistics {
     const unique = new Set<string>();
-    let invalid = 0;
+    let invalidCount = 0;
     
     for (const domain of allDomains) {
         const valid = validateDomain(domain);
         if (valid) {
             unique.add(valid);
         } else {
-            invalid++;
+            invalidCount++;
         }
     }
     
-    const domains = [...unique].sort();
-    const duplicateRate = ((allDomains.length - domains.length) / allDomains.length * 100).toFixed(1);
+    const validUnique = unique.size;
+    const duplicateCount = allDomains.length - validUnique - invalidCount;
+    const duplicateRate = ((duplicateCount / allDomains.length) * 100).toFixed(1);
     
-    console.log(`\n📊 Statistics:`);
-    console.log(`   Valid unique:   ${domains.length.toLocaleString()}`);
-    console.log(`   Duplicates:     ${(allDomains.length - domains.length - invalid).toLocaleString()}`);
-    console.log(`   Invalid:        ${invalid.toLocaleString()}`);
-    console.log(`   Efficiency:     ${duplicateRate}% duplicates removed`);
+    return {
+        totalDownloaded: allDomains.length,
+        validUnique,
+        duplicateCount,
+        invalidCount,
+        duplicateRate
+    };
+}
+
+function generateOutput(domains: string[]): string {
+    const useHostsFormat = domains.length < CONFIG.HOSTS_FORMAT_THRESHOLD;
     
-    if (domains.length === 0) {
-        console.error(`\n❌ Error: No valid domains found`);
-        process.exit(1);
-    }
-    
-    console.log(`\n💾 Generating output...`);
-    
-    const useHostsFormat = domains.length < 500000;
-    let output = `# DNS Blocklist\n# Generated: ${new Date().toISOString()}\n# Total domains: ${domains.length.toLocaleString()}\n# Sources: ${SOURCES.length}\n\n`;
+    let output = [
+        '# DNS Blocklist',
+        `# Generated: ${new Date().toISOString()}`,
+        `# Total domains: ${domains.length.toLocaleString()}`,
+        `# Sources: ${SOURCES.length}`,
+        '',
+        ''
+    ].join('\n');
     
     if (useHostsFormat) {
-        for (const domain of domains) {
-            output += `0.0.0.0 ${domain}\n:: ${domain}\n`;
-        }
+        const entries = domains.map(domain => `0.0.0.0 ${domain}\n:: ${domain}`);
+        output += entries.join('\n');
     } else {
         output += domains.join('\n');
     }
     
-    mkdirSync('./output', { recursive: true });
-    const outputPath = join('./output', `blocklist.txt`);
-    const gzipPath = join('./output', `blocklist.txt.gz`);
+    return output;
+}
+
+function saveOutput(output: string): { outputPath: string; gzipPath: string } {
+    mkdirSync(CONFIG.OUTPUT_DIR, { recursive: true });
+    
+    const outputPath = join(CONFIG.OUTPUT_DIR, CONFIG.OUTPUT_FILE);
+    const gzipPath = join(CONFIG.OUTPUT_DIR, CONFIG.GZIP_FILE);
     
     writeFileSync(outputPath, output);
-    writeFileSync(gzipPath, gzipSync(output, { level: 9 }));
+    
+    const compressed = gzipSync(output, { level: 9 });
+    writeFileSync(gzipPath, compressed);
+    
+    return { outputPath, gzipPath };
+}
+
+async function main(): Promise<void> {
+    console.log('\n🚀 DNS Blocklist Builder\n');
+    
+    const startTime = Date.now();
+    const downloader = new Downloader();
+    
+    const downloadTasks = SOURCES.map((url, index) => 
+        downloadSource(url, index + 1, SOURCES.length, downloader)
+    );
+    
+    const results = await Promise.all(downloadTasks);
+    const allDomains = results.flat();
+    
+    console.log(`\n📥 Total downloaded: ${allDomains.length.toLocaleString()}`);
+    
+    if (allDomains.length === 0) {
+        throw new Error('No domains were downloaded from any source');
+    }
+    
+    console.log(`\n🔍 Processing...`);
+    const stats = processDomains(allDomains);
+    
+    console.log(`\n📊 Statistics:`);
+    console.log(`   Valid unique:   ${stats.validUnique.toLocaleString()}`);
+    console.log(`   Duplicates:     ${stats.duplicateCount.toLocaleString()}`);
+    console.log(`   Invalid:        ${stats.invalidCount.toLocaleString()}`);
+    console.log(`   Efficiency:     ${stats.duplicateRate}% duplicates removed`);
+    
+    if (stats.validUnique === 0) {
+        throw new Error('No valid domains found after processing');
+    }
+    
+    console.log(`\n💾 Generating output...`);
+    const domains = [...new Set(allDomains.filter(validateDomain).map(d => d!))].sort();
+    const output = generateOutput(domains);
+    const { outputPath, gzipPath } = saveOutput(output);
     
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     const sizeKB = (output.length / 1024).toFixed(0);
@@ -166,6 +289,7 @@ async function main(): Promise<void> {
 }
 
 main().catch(error => {
-    console.error(`\n❌ Fatal error: ${error.message}`);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`\n❌ Fatal error: ${message}`);
     process.exit(1);
 });
